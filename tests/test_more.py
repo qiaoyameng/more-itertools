@@ -4808,6 +4808,147 @@ class SampleTests(TestCase):
         expected = set(data)
         self.assertEqual(actual, expected)
 
+    def test_weighted_reservoir_merge_matches_stream(self):
+        """Merging shards must use the same keys as one streamed pass."""
+        rng = Random(20261003)
+        data = [value % 5 for value in range(24)]
+        weights = [1 + value % 7 for value in range(24)]
+        uniform_values = [rng.random() for _ in data]
+
+        uniform_values_iter = iter(uniform_values)
+        streamed = mi.WeightedReservoir(
+            4, rng=uniform_values_iter.__next__
+        )
+        streamed.extend(data, weights)
+
+        partitions = [
+            [0, 24],
+            [0, 1, 24],
+            [0, 7, 7, 20, 24],
+            [0, 3, 11, 19, 24],
+        ]
+        for cuts in partitions:
+            shards = []
+            for start, end in zip(cuts, cuts[1:]):
+                shard_values = iter(uniform_values[start:end])
+                shard = mi.WeightedReservoir(
+                    4, rng=shard_values.__next__
+                )
+                shard.extend(data[start:end], weights[start:end])
+                shards.append(shard)
+
+            merged = mi.WeightedReservoir.merge(*shards)
+            self.assertEqual(merged.sample, streamed.sample)
+            self.assertEqual(list(merged), streamed.sample)
+            self.assertEqual(
+                mi.WeightedReservoir.merge(shards).sample,
+                streamed.sample,
+            )
+            self.assertEqual(
+                mi.WeightedReservoir.merge(*shards).sample,
+                streamed.sample,
+            )
+
+    def test_weighted_reservoir_identical_values(self):
+        """Repeated values are independent and tie keys without comparing."""
+        first = object()
+        second = object()
+        first_reservoir = mi.WeightedReservoir(2, rng=lambda: 0.5)
+        second_reservoir = mi.WeightedReservoir(2, rng=lambda: 0.5)
+        first_reservoir.add(first, 1)
+        second_reservoir.add(second, 1)
+        self.assertEqual(
+            Counter(
+                mi.WeightedReservoir.merge(
+                    first_reservoir, second_reservoir
+                ).sample
+            ),
+            Counter([first, second]),
+        )
+
+        reservoir = mi.WeightedReservoir(2, rng=lambda: 0.5)
+        reservoir.add(first, 1)
+        reservoir.add(second, 1)
+        self.assertEqual(Counter(reservoir.sample), Counter([first, second]))
+
+        left = mi.WeightedReservoir(1, rng=lambda: 0.5)
+        right = mi.WeightedReservoir(1, rng=lambda: 0.5)
+        left.add(first, 1)
+        right.add(second, 1)
+        merged = mi.WeightedReservoir.merge(left, right)
+        self.assertEqual(len(merged.sample), 1)
+        self.assertIn(merged.sample[0], (first, second))
+
+    def test_weighted_reservoir_empty_merge(self):
+        first = mi.WeightedReservoir(1)
+        second = mi.WeightedReservoir.merge(first)
+        self.assertEqual(second.sample, [])
+        with self.assertRaises(ValueError):
+            mi.WeightedReservoir.merge()
+
+        empty = mi.WeightedReservoir(0)
+        with self.assertRaises(ValueError):
+            mi.WeightedReservoir.merge(empty, empty)
+
+    def test_weighted_reservoir_rejects_duplicate_shard(self):
+        shard = mi.WeightedReservoir(2, rng=Random(7).random)
+        shard.extend(['a', 'b', 'c'], [1, 2, 3])
+        with self.assertRaises(ValueError):
+            mi.WeightedReservoir.merge(shard, shard)
+
+    def test_weighted_reservoir_compatibility(self):
+        first = mi.WeightedReservoir(2, rng=Random(8).random)
+        second = mi.WeightedReservoir(2, rng=Random(9).random)
+        first.add('a', 1)
+        second.add('b', 1)
+
+        different_capacity = mi.WeightedReservoir(3, rng=Random(10).random)
+        with self.assertRaises(ValueError):
+            mi.WeightedReservoir.merge(first, different_capacity)
+
+        different_version = mi.WeightedReservoir(2, rng=Random(11).random)
+        different_version.algorithm_version = 2
+        with self.assertRaises(ValueError):
+            mi.WeightedReservoir.merge(first, different_version)
+
+    def test_weighted_reservoir_invalid_weights(self):
+        invalid_weights = [0, -1, float('nan'), float('inf'), -float('inf')]
+        for weight in invalid_weights:
+            reservoir = mi.WeightedReservoir(1)
+            with self.assertRaises(ValueError):
+                reservoir.add('value', weight)
+            with self.assertRaises(ValueError):
+                reservoir.extend(['value'], [weight])
+            with self.assertRaises(ValueError):
+                mi.sample(['value'], 1, weights=[weight])
+
+        reservoir = mi.WeightedReservoir(1)
+        with self.assertRaises(TypeError):
+            reservoir.add('value', '1')
+
+    def test_weighted_reservoir_weight_direction(self):
+        """Repeated fixed draws show that larger weights are favored."""
+        draws = []
+        expected = []
+        for _ in range(10):
+            draws.extend([0.99, 0.1])
+            expected.append('low')
+        for _ in range(10):
+            draws.extend([0.1, 0.5])
+            expected.append('high')
+
+        selections = []
+        draws_iter = iter(draws)
+        for _ in range(20):
+            reservoir = mi.WeightedReservoir(
+                1, rng=draws_iter.__next__
+            )
+            reservoir.add('low', 1)
+            reservoir.add('high', 99)
+            selections.extend(reservoir.sample)
+
+        self.assertEqual(selections, expected)
+
     def test_scale_invariance_of_weights(self):
         """The probability of choosing element a_i is w_i / sum(weights).
         Scaling weights should not change the probability or outcome."""

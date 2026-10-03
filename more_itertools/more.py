@@ -7,7 +7,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from contextlib import suppress
 from functools import cached_property, partial, wraps
-from heapq import heapify, heapreplace
+from heapq import heapify, heappop, heappush, heapreplace
 from itertools import (
     chain,
     combinations,
@@ -25,7 +25,18 @@ from itertools import (
     zip_longest,
     product,
 )
-from math import comb, e, exp, floor, fsum, log, log1p, perm, tau
+from math import (
+    comb,
+    e,
+    exp,
+    floor,
+    fsum,
+    isfinite,
+    log,
+    log1p,
+    perm,
+    tau,
+)
 from math import ceil, prod
 from queue import Empty, Queue
 from random import random, randrange, shuffle, uniform
@@ -42,6 +53,7 @@ from operator import (
 from sys import maxsize
 from time import monotonic
 from threading import Lock
+from uuid import uuid4
 
 from .recipes import (
     _marker,
@@ -176,6 +188,7 @@ __all__ = [
     'value_chain',
     'windowed',
     'windowed_complete',
+    'WeightedReservoir',
     'with_iter',
     'zip_broadcast',
     'zip_offset',
@@ -3887,12 +3900,199 @@ def _sample_unweighted(iterator, k, strict):
     return reservoir
 
 
+def _validate_weight(weight):
+    try:
+        valid_weight = isfinite(weight) and weight > 0
+    except TypeError:
+        raise TypeError('weight must be a finite positive number')
+
+    if not valid_weight:
+        raise ValueError('weight must be a finite positive number')
+
+    return weight
+
+
+class _WeightedReservoirEntry:
+    __slots__ = ('key', 'identity', 'value')
+
+    def __init__(self, key, identity, value):
+        self.key = key
+        self.identity = identity
+        self.value = value
+
+    def __lt__(self, other):
+        if self.key < other.key:
+            return True
+        if self.key > other.key:
+            return False
+        return self.identity < other.identity
+
+
+class WeightedReservoir:
+    """Maintain a weighted without-replacement sample that can be merged.
+
+    Each input is assigned one Efraimidis-Spirakis priority key when it is
+    added. For weight ``w`` and uniform value ``u``, the key is
+    ``log(u) / w``; the reservoir retains the largest keys. Merging combines
+    the keys already assigned in the input reservoirs and never draws new
+    random values.
+
+    Pass an injectable random source as *rng* for reproducibility. It may be a
+    :class:`random.Random` instance or a callable returning uniform values in
+    ``[0.0, 1.0)``.
+
+        >>> from random import Random
+        >>> left = WeightedReservoir(2, rng=Random(2026).random)
+        >>> left.extend(['a', 'b', 'c'], [1, 2, 3])
+        >>> right = WeightedReservoir(2, rng=Random(1066).random)
+        >>> right.extend(['d', 'e'], [4, 5])
+        >>> combined = WeightedReservoir.merge(left, right)
+        >>> len(combined.sample)
+        2
+
+    Equal values are independent occurrences and receive independent stable
+    identities. Those identities only order entries whose floating-point keys
+    happen to be equal; values themselves are never compared.
+
+    Reservoirs being merged must have the same capacity and algorithm
+    version. Reservoirs represent disjoint inputs. Merging the same reservoir
+    twice is duplicate input and raises ``ValueError``.
+    """
+
+    algorithm_version = 1
+
+    def __init__(self, k, *, rng=None):
+        if k < 0:
+            raise ValueError('k must be non-negative')
+
+        self.k = k
+        self._heap = []
+        self._identity_prefix = uuid4()
+        self._next_identity = count(1)
+
+        if rng is None:
+            self._random = random
+        elif callable(rng):
+            self._random = rng
+        else:
+            self._random = rng.random
+
+    @property
+    def capacity(self):
+        return self.k
+
+    def add(self, value, weight):
+        """Add one weighted input to the reservoir."""
+        weight = _validate_weight(weight)
+        if self.k == 0:
+            return
+
+        key = log(self._random()) / weight
+        identity = (
+            self._identity_prefix,
+            next(self._next_identity),
+        )
+        entry = _WeightedReservoirEntry(key, identity, value)
+
+        if len(self._heap) < self.k:
+            heappush(self._heap, entry)
+        elif self._heap[0] < entry:
+            heapreplace(self._heap, entry)
+
+    def extend(self, iterable, weights):
+        """Add paired values and weights to the reservoir."""
+        for value, weight in zip(iterable, weights, strict=True):
+            self.add(value, weight)
+
+    @property
+    def sample(self):
+        """The selected values, ordered from largest to smallest priority."""
+        ordered = sorted(
+            self._heap,
+            key=lambda entry: (-entry.key, entry.identity),
+        )
+        return [entry.value for entry in ordered]
+
+    def __iter__(self):
+        return iter(self.sample)
+
+    def __len__(self):
+        return len(self._heap)
+
+    @classmethod
+    def merge(cls, *reservoirs):
+        """Return a new reservoir containing the merged inputs.
+
+        Pass the reservoirs as separate arguments or as one iterable. The
+        priorities stored in the input reservoirs are retained, so merging
+        does not generate any random values.
+        """
+        if len(reservoirs) == 1 and not isinstance(
+            reservoirs[0], WeightedReservoir
+        ):
+            reservoirs = tuple(reservoirs[0])
+
+        if not reservoirs:
+            raise ValueError('at least one reservoir is required')
+
+        first = reservoirs[0]
+        if not isinstance(first, WeightedReservoir):
+            raise TypeError('can only merge WeightedReservoir instances')
+
+        if first.algorithm_version != cls.algorithm_version:
+            raise ValueError(
+                'incompatible weighted reservoir algorithm version'
+            )
+
+        merged = cls(first.k)
+        entries = []
+        seen_identities = set()
+        seen_reservoirs = set()
+
+        for reservoir in reservoirs:
+            if not isinstance(reservoir, WeightedReservoir):
+                raise TypeError('can only merge WeightedReservoir instances')
+            if reservoir.k != first.k:
+                raise ValueError('weighted reservoir capacities must match')
+            if reservoir.algorithm_version != first.algorithm_version:
+                raise ValueError(
+                    'incompatible weighted reservoir algorithm version'
+                )
+
+            reservoir_id = id(reservoir)
+            if reservoir_id in seen_reservoirs:
+                raise ValueError(
+                    'the same weighted reservoir shard cannot be merged twice'
+                )
+            seen_reservoirs.add(reservoir_id)
+
+            for entry in reservoir._heap:
+                if entry.identity in seen_identities:
+                    raise ValueError(
+                        'the same weighted reservoir shard cannot be merged '
+                        'twice'
+                    )
+                seen_identities.add(entry.identity)
+                entries.append(entry)
+
+        heapify(entries)
+        while len(entries) > first.k:
+            heappop(entries)
+        heapify(entries)
+        merged._heap = entries
+        return merged
+
+
 def _sample_weighted(iterator, k, weights, strict):
     # Implementation of "A-ExpJ" from the 2006 paper by Efraimidis et al. :
     # "Weighted random sampling with a reservoir".
 
+    def weight_keys():
+        for weight in weights:
+            yield log(random()) / _validate_weight(weight)
+
     # Log-transform for numerical stability for weights that are small/large
-    weight_keys = (log(random()) / weight for weight in weights)
+    weight_keys = weight_keys()
 
     # Fill up the reservoir (collection of samples) with the first `k`
     # weight-keys and elements, then heapify the list.
@@ -3908,6 +4108,7 @@ def _sample_weighted(iterator, k, weights, strict):
     weights_to_skip = log(random()) / smallest_weight_key
 
     for weight, element in zip(weights, iterator):
+        weight = _validate_weight(weight)
         if weight >= weights_to_skip:
             # The notation here is consistent with the paper, but we store
             # the weight-keys in log-space for better numerical stability.

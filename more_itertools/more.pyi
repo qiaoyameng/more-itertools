@@ -149,6 +149,7 @@ __all__ = [
     'value_chain',
     'windowed',
     'windowed_complete',
+    'WeightedReservoir',
     'with_iter',
     'zip_broadcast',
     'zip_offset',
@@ -173,6 +174,10 @@ _SupportsLessThan: TypeAlias = SupportsDunderLT[Any]
 
 @type_check_only
 class _SizedReversible(Sized, Reversible[_T_co], Protocol[_T_co]): ...
+
+@type_check_only
+class _RandomSource(Protocol):
+    def random(self) -> float: ...
 
 def chunked(
     iterable: Iterable[_T], n: int | None, strict: bool = ...
@@ -747,6 +752,35 @@ def map_if(
     func: Callable[[Any], Any],
     func_else: Callable[[Any], Any] | None = ...,
 ) -> Iterator[Any]: ...
+class WeightedReservoir(Generic[_T]):
+    algorithm_version: int
+    k: int
+    def __init__(
+        self,
+        k: int,
+        *,
+        rng: Callable[[], float] | _RandomSource | None = ...,
+    ) -> None: ...
+    @property
+    def capacity(self) -> int: ...
+    def add(self, value: _T, weight: float) -> None: ...
+    def extend(
+        self, iterable: Iterable[_T], weights: Iterable[float]
+    ) -> None: ...
+    @property
+    def sample(self) -> list[_T]: ...
+    def __iter__(self) -> Iterator[_T]: ...
+    def __len__(self) -> int: ...
+    @overload
+    @classmethod
+    def merge(
+        cls, *reservoirs: WeightedReservoir[_T]
+    ) -> WeightedReservoir[_T]: ...
+    @overload
+    @classmethod
+    def merge(
+        cls, reservoirs: Iterable[WeightedReservoir[_T]]
+    ) -> WeightedReservoir[_T]: ...
 def _sample_unweighted(
     iterator: Iterator[_T], k: int, strict: bool
 ) -> list[_T]: ...
