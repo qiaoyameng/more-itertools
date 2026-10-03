@@ -75,6 +75,7 @@ Python iterables.
 | Summarizing            | `ilen <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.ilen>`_,                                                                                     |
 |                        | `unique_to_each <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.unique_to_each>`_,                                                                 |
 |                        | `sample <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.sample>`_,                                                                                 |
+|                        | `WeightedReservoir <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.WeightedReservoir>`_,                                                           |
 |                        | `consecutive_groups <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.consecutive_groups>`_,                                                         |
 |                        | `run_length <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.run_length>`_,                                                                         |
 |                        | `map_reduce <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.map_reduce>`_,                                                                         |

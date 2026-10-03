@@ -7,7 +7,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from contextlib import suppress
 from functools import cached_property, partial, wraps
-from heapq import heapify, heapreplace
+from heapq import heapify, heappush, heapreplace, nlargest
 from itertools import (
     chain,
     combinations,
@@ -25,8 +25,9 @@ from itertools import (
     zip_longest,
     product,
 )
-from math import comb, e, exp, floor, fsum, log, log1p, perm, tau
+from math import comb, e, exp, floor, fsum, isfinite, log, log1p, perm, tau
 from math import ceil, prod
+from numbers import Real
 from queue import Empty, Queue
 from random import random, randrange, shuffle, uniform
 from operator import (
@@ -61,6 +62,7 @@ from .recipes import (
 __all__ = [
     'AbortThread',
     'SequenceView',
+    'WeightedReservoir',
     'adjacent',
     'all_unique',
     'always_iterable',
@@ -4042,6 +4044,150 @@ def sample(iterable, k, weights=None, *, counts=None, strict=False):
 
     else:
         return _sample_unweighted(iterator, k, strict)
+
+
+class WeightedReservoir:
+    """A weighted reservoir sampler that stores a random priority key for
+    each retained item, so that independently sampled shards can be merged
+    into a single weighted sample drawn without replacement.
+
+    When a population is processed in disjoint shards (e.g. log partitions),
+    sampling *k* items from each shard and then sub-sampling the
+    intermediate results uniformly over-represents small shards.  Instead,
+    run one reservoir per shard and :meth:`merge` them - merging keeps the
+    *k* items with the largest stored keys, which is exactly the sample a
+    single reservoir over the concatenated population would have produced:
+
+    >>> from random import Random
+    >>> population = list(range(10))
+    >>> weights = [1, 1, 1, 1, 2, 2, 2, 4, 4, 8]
+    >>> streaming = WeightedReservoir(3, rng=Random(8675309)).update(
+    ...     population, weights=weights)
+    >>> rng = Random(8675309)
+    >>> shards = [
+    ...     WeightedReservoir(3, rng=rng).update(population[:4], weights[:4]),
+    ...     WeightedReservoir(3, rng=rng).update(population[4:], weights[4:]),
+    ... ]
+    >>> shards[0].merge(shards[1]).sample() == streaming.sample()
+    True
+
+    Each item's key is generated exactly once, when the item is added;
+    merging never re-draws keys.  Records with equal values are treated as
+    distinct occurrences, and keys that compare equal are disambiguated by
+    a stable insertion identity, so the sampled items themselves are never
+    compared with each other.
+
+    Weights must be finite, positive numbers; zero, negative, ``nan``, and
+    infinite weights raise ``ValueError``, and non-numeric weights raise
+    ``TypeError``.
+
+    Merging requires both reservoirs to have the same capacity *k* and the
+    same algorithm version.  Note that merging the same shard twice (or two
+    reservoirs that were fed the same records) counts those records twice -
+    that is duplicate input, not a larger sample.
+
+    The *rng* argument, if given, is a source of randomness with a
+    ``random()`` method (such as a :class:`random.Random` instance); the
+    :mod:`random` module's global generator is used by default.
+    """
+
+    _ALGORITHM_VERSION = 'A-ExpJ/1'
+
+    _identity_counter = count()
+
+    def __init__(self, k, rng=None):
+        if k < 0:
+            raise ValueError('k must be non-negative')
+        self._k = k
+        self._rng = rng
+        self._version = self._ALGORITHM_VERSION
+        # Min-heap of (key, identity, item); the k largest keys are kept.
+        self._heap = []
+
+    def __len__(self):
+        return len(self._heap)
+
+    def __repr__(self):
+        return (
+            f'{type(self).__name__}(k={self._k!r}, '
+            f'size={len(self._heap)!r})'
+        )
+
+    @property
+    def k(self):
+        """The reservoir capacity."""
+        return self._k
+
+    def add(self, item, weight=1.0):
+        """Add *item* with the given *weight* to the reservoir, generating
+        its priority key, and return ``self``."""
+        if not isinstance(weight, Real):
+            raise TypeError('weight must be a real number')
+        if not isfinite(weight) or weight <= 0:
+            raise ValueError('weight must be a finite, positive number')
+        if self._k == 0:
+            return self
+
+        rng = self._rng
+        uniform = rng.random() if rng is not None else random()
+        # A-ExpJ key, stored in log-space: log(u) / weight with u in (0, 1].
+        key = log(1.0 - uniform) / weight
+        identity = next(WeightedReservoir._identity_counter)
+        entry = (key, identity, item)
+
+        if len(self._heap) < self._k:
+            heappush(self._heap, entry)
+        elif entry[:2] > self._heap[0][:2]:
+            heapreplace(self._heap, entry)
+
+        return self
+
+    def update(self, iterable, weights=None):
+        """Add every item of *iterable* to the reservoir and return
+        ``self``.  If *weights* is given, it is zipped with *iterable*."""
+        if weights is None:
+            for item in iterable:
+                self.add(item)
+        else:
+            for item, weight in zip(iterable, weights):
+                self.add(item, weight)
+
+        return self
+
+    def merge(self, other):
+        """Return a new reservoir combining this one with *other*, keeping
+        the *k* items with the largest stored keys.  No new keys are drawn.
+
+        Both reservoirs must have the same capacity and algorithm version.
+        Merging a reservoir with itself raises ``ValueError``; merging two
+        reservoirs that were fed the same records is duplicate input and
+        counts those records twice.
+        """
+        if other is self:
+            raise ValueError(
+                'merging a reservoir with itself duplicates its inputs'
+            )
+        if not isinstance(other, WeightedReservoir):
+            raise TypeError('can only merge with another WeightedReservoir')
+        if self._k != other._k:
+            raise ValueError('reservoir capacities (k) must match to merge')
+        if self._version != other._version:
+            raise ValueError('algorithm versions must match to merge')
+
+        merged = WeightedReservoir(self._k, rng=self._rng)
+        merged._version = self._version
+        entries = nlargest(
+            self._k, chain(self._heap, other._heap), key=lambda e: e[:2]
+        )
+        merged._heap = list(entries)
+        heapify(merged._heap)
+        return merged
+
+    def sample(self):
+        """Return the retained items as a list, ordered by descending
+        priority key."""
+        entries = sorted(self._heap, key=lambda e: e[:2], reverse=True)
+        return [item for _, _, item in entries]
 
 
 def is_sorted(iterable, key=None, reverse=False, strict=False):

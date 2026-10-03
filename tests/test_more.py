@@ -4881,6 +4881,159 @@ class SampleTests(TestCase):
             mi.sample('abcde', 10, counts=[1, 1, 1, 1, 1], strict=True)
 
 
+class WeightedReservoirTests(TestCase):
+    def test_streaming_matches_merged_shards(self):
+        """Merging per-shard reservoirs equals one streaming reservoir."""
+        population = list(range(200))
+        weights = [((i * 37) % 11) + 1 for i in population]
+        k = 17
+
+        # Rectified (streaming) processing of the whole population
+        streaming = mi.WeightedReservoir(k, rng=Random(8675309))
+        streaming.update(population, weights=weights)
+
+        # Uneven shards fed the same injected randomness in the same order
+        rng = Random(8675309)
+        bounds = [(0, 50), (50, 120), (120, 200)]
+        shards = [
+            mi.WeightedReservoir(k, rng=rng).update(
+                population[start:stop], weights[start:stop]
+            )
+            for start, stop in bounds
+        ]
+
+        merged = shards[0].merge(shards[1]).merge(shards[2])
+        self.assertEqual(merged.sample(), streaming.sample())
+
+        # Merge order and grouping must not matter
+        merged_alt = shards[2].merge(shards[0]).merge(shards[1])
+        self.assertEqual(merged_alt.sample(), streaming.sample())
+
+    def test_merge_does_not_redraw_keys(self):
+        """Keys are generated once at insertion; merging draws nothing."""
+
+        class CountingRandom:
+            def __init__(self):
+                self._rng = Random(1234)
+                self.calls = 0
+
+            def random(self):
+                self.calls += 1
+                return self._rng.random()
+
+        rng = CountingRandom()
+        first = mi.WeightedReservoir(5, rng=rng).update(range(10))
+        second = mi.WeightedReservoir(5, rng=rng).update(range(10, 20))
+        calls_before_merge = rng.calls
+
+        merged = first.merge(second)
+        self.assertEqual(rng.calls, calls_before_merge)
+
+        # The merged sample holds the 5 largest keys drawn overall
+        streaming = mi.WeightedReservoir(5, rng=Random(1234))
+        streaming.update(range(20))
+        self.assertEqual(merged.sample(), streaming.sample())
+
+    def test_duplicate_values_are_distinct_occurrences(self):
+        reservoir = mi.WeightedReservoir(2, rng=Random(7))
+        reservoir.update(['x', 'x', 'x'], weights=[1, 1, 1])
+        self.assertEqual(reservoir.sample(), ['x', 'x'])
+        self.assertEqual(len(reservoir), 2)
+
+    def test_key_ties_broken_by_stable_identity(self):
+        """Equal keys never cause item comparisons; ties are stable."""
+
+        class ConstantRandom:
+            def random(self):
+                return 0.5
+
+        # object() instances are not orderable
+        items = [object() for _ in range(5)]
+        reservoir = mi.WeightedReservoir(2, rng=ConstantRandom())
+        for item in items:
+            reservoir.add(item, weight=1.0)
+
+        # All keys tie, so the stable insertion identity decides: the two
+        # most recently inserted items win, in descending identity order.
+        self.assertEqual(reservoir.sample(), [items[4], items[3]])
+
+        # Ties are broken the same way after merging
+        other = mi.WeightedReservoir(2, rng=ConstantRandom())
+        other_items = [object() for _ in range(3)]
+        for item in other_items:
+            other.add(item, weight=1.0)
+        merged = reservoir.merge(other)
+        self.assertEqual(merged.sample(), [other_items[2], other_items[1]])
+
+    def test_weight_validation(self):
+        reservoir = mi.WeightedReservoir(1, rng=Random(0))
+        for bad_weight in (0.0, -1.0, float('inf'), float('nan')):
+            with self.assertRaises(ValueError):
+                reservoir.add('x', weight=bad_weight)
+        with self.assertRaises(TypeError):
+            reservoir.add('x', weight='heavy')
+
+    def test_merge_requires_matching_capacity(self):
+        first = mi.WeightedReservoir(2, rng=Random(1))
+        second = mi.WeightedReservoir(3, rng=Random(1))
+        with self.assertRaises(ValueError):
+            first.merge(second)
+
+    def test_merge_requires_matching_version(self):
+        first = mi.WeightedReservoir(2, rng=Random(1))
+        second = mi.WeightedReservoir(2, rng=Random(1))
+        second._version = 'A-ExpJ/0'
+        with self.assertRaises(ValueError):
+            first.merge(second)
+
+    def test_merge_with_self_is_duplicate_input(self):
+        reservoir = mi.WeightedReservoir(2, rng=Random(1))
+        reservoir.update([1, 2, 3])
+        with self.assertRaises(ValueError):
+            reservoir.merge(reservoir)
+
+    def test_merge_with_wrong_type(self):
+        reservoir = mi.WeightedReservoir(2, rng=Random(1))
+        with self.assertRaises(TypeError):
+            reservoir.merge([1, 2, 3])
+
+    def test_negative_k(self):
+        with self.assertRaises(ValueError):
+            mi.WeightedReservoir(-1)
+
+    def test_zero_capacity(self):
+        reservoir = mi.WeightedReservoir(0, rng=Random(0))
+        reservoir.update([1, 2, 3])
+        self.assertEqual(reservoir.sample(), [])
+        self.assertEqual(len(reservoir), 0)
+
+    def test_reproducibility_with_seeded_rng(self):
+        def run():
+            reservoir = mi.WeightedReservoir(5, rng=Random(42))
+            reservoir.update(range(50), weights=range(1, 51))
+            return reservoir.sample()
+
+        self.assertEqual(run(), run())
+
+    def test_weight_direction_repeated_trials(self):
+        """A heavier weight must win far more often.  The randomness is
+        seeded, so the run is deterministic; the threshold is far below
+        the expected count (~396/400) and far above what an unweighted
+        (~200/400) or inverted (~4/400) implementation could reach, so
+        passing cannot be a chance event."""
+        rng = Random(20261003)
+        trials = 400
+        heavy_wins = 0
+        for _ in range(trials):
+            reservoir = mi.WeightedReservoir(1, rng=rng)
+            reservoir.add('light', weight=1.0)
+            reservoir.add('heavy', weight=100.0)
+            if reservoir.sample() == ['heavy']:
+                heavy_wins += 1
+
+        self.assertGreaterEqual(heavy_wins, 360)
+
+
 class BarelySortable:
     def __init__(self, value):
         self.value = value
