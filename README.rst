@@ -66,7 +66,8 @@ Python iterables.
 |                        | `roundrobin <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.roundrobin>`_,                                                                         |
 |                        | `prepend <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.prepend>`_,                                                                               |
 |                        | `value_chain <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.value_chain>`_,                                                                       |
-|                        | `partial_product <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.partial_product>`_                                                                |
+|                        | `partial_product <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.partial_product>`_,                                                               |
+|                        | `diagonal_product <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.diagonal_product>`_                                                              |
 +------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | Concurrency            | `concurrent_tee <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.concurrent_tee>`_,                                                                 |
 |                        | `serialize <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.serialize>`_,                                                                           |

@@ -84,6 +84,7 @@ __all__ = [
     'countable',
     'derangements',
     'dft',
+    'diagonal_product',
     'difference',
     'distinct_combinations',
     'distinct_permutations',
@@ -4988,6 +4989,91 @@ def constrained_batches(
 
     if batch:
         yield tuple(batch)
+
+
+def diagonal_product(*iterables):
+    """Yield tuples of the Cartesian product of the input *iterables* in
+    diagonal order: tuples are grouped into layers by the sum of the indexes
+    of their items, and every combination of finite indexes is eventually
+    produced - even when some of the input iterables are infinite.
+
+    :func:`itertools.product` never gets past the first iterable when it is
+    infinite, because it reads each input pool in full before advancing.
+    This function only reads as far into each input as the layers it has
+    emitted require:
+
+        >>> from itertools import count, islice
+        >>> list(islice(diagonal_product(count(), 'AB'), 6))
+        [(0, 'A'), (1, 'A'), (0, 'B'), (2, 'A'), (1, 'B'), (3, 'A')]
+
+    Within a layer, tuples are emitted in a fixed order: lexicographic by
+    their index tuple, with earlier indexes decreasing first. For finite
+    inputs the whole product is produced:
+
+        >>> list(diagonal_product('ABC', range(2)))
+        [('A', 0), ('B', 0), ('A', 1), ('C', 0), ('B', 1), ('C', 1)]
+
+    When an input iterable is exhausted, enumeration continues with the
+    combinations that can still be formed from the items already read from
+    it. If any input is empty, no tuples can be formed and iteration stops.
+
+    Items are selected by position, never compared by value, so duplicate
+    values from different input positions all appear in the output:
+
+        >>> list(diagonal_product([1, 1], [1]))
+        [(1, 1), (1, 1)]
+
+    Note that items read from the input iterables are cached so that they
+    can be combined with items read later, so the cache grows with the
+    prefix of each input that has been consumed so far. Enumerating the
+    product of infinite iterables therefore cannot be done in constant
+    memory.
+    """
+    iterators = tuple(map(iter, iterables))
+    dimension = len(iterators)
+    if dimension == 0:
+        yield ()
+        return
+
+    caches = [[] for _ in iterators]
+    live = [True] * dimension
+
+    def index_tuples(total, limits):
+        # Yield the index tuples whose entries sum to *total*, with the
+        # entry at each position below the corresponding limit, in a fixed
+        # order: earlier indexes decrease first.
+        if len(limits) == 1:
+            if total < limits[0]:
+                yield (total,)
+            return
+        for index in range(min(total, limits[0] - 1), -1, -1):
+            for rest in index_tuples(total - index, limits[1:]):
+                yield (index,) + rest
+
+    level = 0
+    while True:
+        # Pull at most one new item from each input that is not known to
+        # be exhausted, so that index *level* is available wherever the
+        # input can provide it.
+        for d, iterator in enumerate(iterators):
+            if live[d] and len(caches[d]) <= level:
+                try:
+                    caches[d].append(next(iterator))
+                except StopIteration:
+                    live[d] = False
+
+        limits = tuple(map(len, caches))
+        if 0 in limits:
+            # An empty input can never contribute to a tuple.
+            return
+        if not any(live) and level > sum(limits) - dimension:
+            # Every input is exhausted and the highest reachable index
+            # sum has been passed.
+            return
+
+        for index_tuple in index_tuples(level, limits):
+            yield tuple(caches[d][i] for d, i in enumerate(index_tuple))
+        level += 1
 
 
 def gray_product(*iterables, repeat=1):

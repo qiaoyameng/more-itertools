@@ -6340,6 +6340,176 @@ class ConstrainedBatchesTests(TestCase):
             list(mi.constrained_batches([], 0))
 
 
+class DiagonalProductTests(TestCase):
+    def test_no_iterables(self):
+        self.assertEqual(list(mi.diagonal_product()), [()])
+
+    def test_empty_iterable(self):
+        # An empty dimension means no tuples can ever be formed
+        self.assertEqual(list(mi.diagonal_product('AB', '', 'CD')), [])
+        self.assertEqual(list(mi.diagonal_product([], count())), [])
+
+    def test_one_iterable(self):
+        self.assertEqual(
+            list(mi.diagonal_product('ABC')), [('A',), ('B',), ('C',)]
+        )
+
+    def test_two_iterables(self):
+        self.assertEqual(
+            list(mi.diagonal_product('ABC', range(2))),
+            [
+                ('A', 0),
+                ('B', 0),
+                ('A', 1),
+                ('C', 0),
+                ('B', 1),
+                ('C', 1),
+            ],
+        )
+
+    def test_duplicate_values_not_deduped(self):
+        # Equal values at different input positions are distinct
+        self.assertEqual(
+            list(mi.diagonal_product([1, 1], [1, 1])),
+            [(1, 1), (1, 1), (1, 1), (1, 1)],
+        )
+
+    def test_infinite_with_finite(self):
+        # An infinite counter combined with a 3-element list: check that
+        # the first layers are complete and that sources are read lazily.
+        class ReadCounter:
+            def __init__(self, iterable):
+                self._iterator = iter(iterable)
+                self.reads = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.reads += 1
+                return next(self._iterator)
+
+        counter = ReadCounter(count())
+        trio = ReadCounter(['a', 'b', 'c'])
+        it = mi.diagonal_product(counter, trio)
+
+        expected_layers = [
+            [(0, 'a')],
+            [(1, 'a'), (0, 'b')],
+            [(2, 'a'), (1, 'b'), (0, 'c')],
+            [(3, 'a'), (2, 'b'), (1, 'c')],
+        ]
+        for level, expected in enumerate(expected_layers):
+            with self.subTest(level=level):
+                self.assertEqual(list(islice(it, len(expected))), expected)
+                # One new item per source per layer; the fourth read of
+                # the 3-element list is the one that finds it exhausted.
+                self.assertEqual(counter.reads, level + 1)
+                self.assertEqual(trio.reads, min(level + 1, 4))
+
+        # Layers 0-3 together cover every (i, j) with i + j <= 3, j < 3
+        seen = set(chain.from_iterable(expected_layers))
+        self.assertEqual(
+            seen,
+            {
+                (i, letter)
+                for i in range(4)
+                for letter in 'abc'
+                if i + 'abc'.index(letter) <= 3
+            },
+        )
+
+        # The exhausted list no longer produces new items, but
+        # combinations with its cached prefix keep coming.
+        self.assertEqual(
+            list(islice(it, 3)), [(4, 'a'), (3, 'b'), (2, 'c')]
+        )
+        self.assertEqual(trio.reads, 4)
+
+    def test_three_dimensions(self):
+        pools = (('A', 'B'), ('x', 'y'), (0, 1))
+        result = list(mi.diagonal_product(*pools))
+        self.assertEqual(
+            result,
+            [
+                ('A', 'x', 0),
+                ('B', 'x', 0),
+                ('A', 'y', 0),
+                ('A', 'x', 1),
+                ('B', 'y', 0),
+                ('B', 'x', 1),
+                ('A', 'y', 1),
+                ('B', 'y', 1),
+            ],
+        )
+        # Same tuples as itertools.product, exactly once each
+        self.assertEqual(sorted(result), sorted(product(*pools)))
+        # Index sums never decrease, and each layer is in descending
+        # lexicographic order of its index tuples
+        index_tuples = [
+            tuple(pool.index(value) for pool, value in zip(pools, t))
+            for t in result
+        ]
+        self.assertEqual(
+            list(map(sum, index_tuples)), sorted(map(sum, index_tuples))
+        )
+        for _, layer in groupby(index_tuples, key=sum):
+            layer = list(layer)
+            self.assertEqual(layer, sorted(layer, reverse=True))
+
+    def test_three_dimensions_with_infinite(self):
+        self.assertEqual(
+            list(islice(mi.diagonal_product(count(1), 'AB', [0]), 6)),
+            [
+                (1, 'A', 0),
+                (2, 'A', 0),
+                (1, 'B', 0),
+                (3, 'A', 0),
+                (2, 'B', 0),
+                (4, 'A', 0),
+            ],
+        )
+
+    def test_source_error_closes(self):
+        events = []
+
+        def failing():
+            try:
+                yield 0
+                yield 1
+                raise ValueError('boom')
+            finally:
+                events.append('failing closed')
+
+        it = mi.diagonal_product(failing(), count())
+        self.assertEqual(next(it), (0, 0))
+        self.assertEqual(next(it), (1, 0))
+        self.assertEqual(next(it), (0, 1))
+        # The source's error propagates out of the iterator...
+        with self.assertRaises(ValueError):
+            next(it)
+        # ...and the iterator is closed afterwards
+        with self.assertRaises(StopIteration):
+            next(it)
+        self.assertEqual(events, ['failing closed'])
+
+    def test_close(self):
+        events = []
+
+        def source():
+            try:
+                yield from count()
+            finally:
+                events.append('closed')
+
+        it = mi.diagonal_product(source(), source())
+        next(it)
+        it.close()
+        del it
+        gc.collect()  # Force collection on PyPy
+        self.assertEqual(events, ['closed', 'closed'])
+
+
 class GrayProductTests(TestCase):
     def test_basic(self):
         self.assertEqual(

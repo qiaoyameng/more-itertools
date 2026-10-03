@@ -115,6 +115,7 @@ These tools combine multiple iterables.
 **New itertools**
 
 .. autofunction:: collapse
+.. autofunction:: diagonal_product
 .. autofunction:: interleave
 .. autofunction:: interleave_longest
 .. autofunction:: interleave_evenly
