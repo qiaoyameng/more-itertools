@@ -59,6 +59,9 @@ from .recipes import (
 )
 
 __all__ = [
+    'AGAIN',
+    'EXHAUSTED',
+    'WOULD_BLOCK',
     'AbortThread',
     'SequenceView',
     'adjacent',
@@ -68,6 +71,8 @@ __all__ = [
     'argmax',
     'argmin',
     'bucket',
+    'BucketWouldBlock',
+    'bounded_bucket',
     'callback_iter',
     'chunked',
     'chunked_even',
@@ -1238,6 +1243,307 @@ class bucket:
             return iter(())
 
         return self._get_values(value)
+
+
+class BucketWouldBlock(Exception):
+    """Raised by a :class:`bounded_bucket` child iterator when no item is
+    available right now without exceeding the cache capacity.
+
+    The bucket is unchanged by this, so another consumer draining a key frees
+    space after which reading can be retried. Prefer the non-blocking
+    :meth:`bounded_bucket.advance` interface to catch this condition without
+    exceptions.
+    """
+
+
+class _bounded_sentinel:
+    __slots__ = ('_name',)
+
+    def __init__(self, name):
+        self._name = name
+
+    def __repr__(self):
+        return self._name
+
+    def __bool__(self):  # pragma: no cover - always use identity checks
+        raise TypeError(
+            f'{self._name!r} is a sentinel; compare with `is`, '
+            'never truthiness'
+        )
+
+
+#: No item is available yet, but the source was advanced while scanning:
+#: data for another key was integrated into the cache. Retry the same read.
+AGAIN = _bounded_sentinel('AGAIN')
+
+#: The cache (including the single held candidate) is full and no buffered
+#: item for the requested key exists. Retry after another consumer drains
+#: a key.
+WOULD_BLOCK = _bounded_sentinel('WOULD_BLOCK')
+
+#: The source is exhausted and no buffered item for the requested key exists.
+EXHAUSTED = _bounded_sentinel('EXHAUSTED')
+
+
+class bounded_bucket:
+    """Bucket *iterable* into child iterables by *key*, like :class:`bucket`,
+    but with an explicit upper bound on retained records and explicit
+    lifecycle management of keys.
+
+    At most *capacity* source records are retained at any time, split between
+    items already integrated into key queues and at most **one** item that has
+    been pulled from the source but not yet integrated (the "candidate").
+
+        >>> iterable = ['a1', 'b1', 'a2', 'b2']
+        >>> b = bounded_bucket(iterable, key=lambda x: x[0], capacity=4)
+        >>> results = []
+        >>> while True:
+        ...     step = b.advance('a')
+        ...     if step is AGAIN:
+        ...         continue
+        ...     if step is EXHAUSTED:
+        ...         break
+        ...     results.append(step)
+        >>> results
+        ['a1', 'a2']
+
+    **Non-blocking reads.** A fast branch looking for its next item may run
+    into data belonging to slow branches. That data is cached rather than
+    discarded, and :meth:`advance` performs one bounded micro-step, returning:
+
+    * the next item for the key;
+    * :data:`AGAIN` if another key's item was just integrated (retry, this is
+      progress, not a block);
+    * :data:`WOULD_BLOCK` if pulling the next source item would exceed
+      *capacity*. This is recoverable: once another consumer drains a key,
+      space opens up and the same read resumes;
+    * :data:`EXHAUSTED` if the source is spent with nothing buffered.
+
+        >>> b = bounded_bucket(
+        ...     iter(['x', 'y', 'z', 'a1']), key=lambda x: x[0], capacity=3
+        ... )
+        >>> results = []
+        >>> while True:
+        ...     step = b.advance('a')
+        ...     if step is AGAIN:
+        ...         results.append('again')
+        ...     elif step is WOULD_BLOCK:
+        ...         # No room: drain the buffered key, freeing space.
+        ...         b.close('z')
+        ...     else:
+        ...         results.append(step)
+        ...         break
+        >>> results
+        ['again', 'again', 'again', 'a1']
+
+    Note that ``len(b)`` counts integrated records *and* the held candidate,
+    so it never exceeds *capacity*.
+
+    **Closing keys.** :meth:`close` marks keys as permanently skipped: future
+    source items for them are dropped, their buffered records are released,
+    and iterators already handed out for them terminate normally at their next
+    read.
+
+        >>> b = bounded_bucket(['a1', 'b1', 'b2'], lambda x: x[0], capacity=3)
+        >>> a = b['a']
+        >>> next(a)
+        'a1'
+        >>> b.close('a')
+        >>> list(a)
+        []
+        >>> list(b['a'])
+        []
+        >>> list(b['b'])
+        ['b1', 'b2']
+
+    **Bounded key introspection.** Unlike :class:`bucket`, iterating the
+    bucket (:meth:`keys`) and ``key in b`` never drain the source. ``keys()``
+    returns exactly the live keys with buffered records right now, and
+    ``key in b`` only reports buffered data.
+
+        >>> b = bounded_bucket(count(), lambda x: x % 2, capacity=4)
+        >>> list(b.keys())  # infinite source is safe
+        []
+        >>> b.advance(1) is AGAIN  # pulls 0, buffers it for key 0
+        True
+        >>> list(b.keys())
+        [0]
+        >>> 0 in b
+        True
+        >>> 2 in b
+        False
+
+    Child iterators also expose ``advance``; plain ``next`` turns
+    :data:`WOULD_BLOCK` into :class:`BucketWouldBlock` so the standard iterator
+    protocol is available.
+    """
+
+    def __init__(self, iterable, key, capacity):
+        if not isinstance(capacity, int) or capacity < 1:
+            raise ValueError('capacity must be a positive integer')
+
+        self._it = iter(iterable)
+        self._key = key
+        self._capacity = capacity
+        # key -> deque of integrated items (open keys only)
+        self._cache = {}
+        self._closed = set()
+        # one pulled-but-not-integrated item, or None
+        self._candidate = None
+        # outstanding child iterators per key
+        self._iterators = defaultdict(list)
+        self._exhausted = False
+
+    @property
+    def capacity(self):
+        return self._capacity
+
+    def __len__(self):
+        """Number of retained records: integrated items plus the candidate."""
+        return sum(len(queue) for queue in self._cache.values()) + (
+            1 if self._candidate is not None else 0
+        )
+
+    def keys(self):
+        """Return the live keys that currently hold buffered records.
+
+        The source is never advanced. The result includes the key of any held
+        candidate and excludes closed keys.
+        """
+        result = [key for key, queue in self._cache.items() if queue]
+        if self._candidate is not None:
+            candidate_key = self._key(self._candidate)
+            if (
+                candidate_key not in self._closed
+                and candidate_key not in result
+            ):
+                result.append(candidate_key)
+        return result
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __contains__(self, key):
+        """Return whether *key* has a buffered record right now.
+
+        The source is never advanced, so this stays bounded for infinite
+        inputs. Closed keys are never contained.
+        """
+        if key in self._closed:
+            return False
+
+        if (
+            self._candidate is not None
+            and self._key(self._candidate) == key
+        ):
+            return True
+
+        return bool(self._cache.get(key))
+
+    def close(self, *keys):
+        """Permanently stop tracking *keys*.
+
+        Buffered records for them are released, future source items for them
+        are skipped, and outstanding iterators for them terminate normally at
+        their next read. Capacity freed this way lets blocked reads resume.
+        """
+        for key in keys:
+            self._closed.add(key)
+            self._cache.pop(key, None)
+            if (
+                self._candidate is not None
+                and self._key(self._candidate) == key
+            ):
+                self._candidate = None
+            for child in self._iterators.pop(key, ()):
+                child._closed = True
+
+    def __getitem__(self, key):
+        if key in self._closed:
+            return iter(())
+
+        child = _bounded_bucket_iterator(self, key)
+        self._iterators[key].append(child)
+        return child
+
+    def advance(self, key):
+        """Perform one bounded micro-step of reading *key*.
+
+        Returns the next item, or one of :data:`AGAIN`, :data:`WOULD_BLOCK`
+        and :data:`EXHAUSTED`.
+        """
+        if key in self._closed:
+            return EXHAUSTED
+
+        queue = self._cache.get(key)
+        if queue:
+            return queue.popleft()
+
+        if self._exhausted:
+            return EXHAUSTED
+
+        # No integrated item for the key; scan the source one item at a time.
+        if self._candidate is None:
+            # Retained records already reach capacity; pulling would exceed it.
+            if len(self) >= self._capacity:
+                return WOULD_BLOCK
+
+            try:
+                self._candidate = next(self._it)
+            except StopIteration:
+                self._exhausted = True
+                return EXHAUSTED
+
+        candidate = self._candidate
+        candidate_key = self._key(candidate)
+
+        if candidate_key in self._closed:
+            # Closed keys are skipped; the held slot is released.
+            self._candidate = None
+            return AGAIN
+
+        if candidate_key == key:
+            self._candidate = None
+            return candidate
+
+        # Candidate belongs to another (open) key: integrate it. Space exists
+        # because the candidate itself was counted against the capacity.
+        self._cache.setdefault(candidate_key, deque()).append(candidate)
+        self._candidate = None
+        return AGAIN
+
+
+class _bounded_bucket_iterator:
+    __slots__ = ('_bucket', '_key', '_closed')
+
+    def __init__(self, bucket, key):
+        self._bucket = bucket
+        self._key = key
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def advance(self):
+        """One bounded micro-step; see :meth:`bounded_bucket.advance`."""
+        if self._closed:
+            return EXHAUSTED
+
+        return self._bucket.advance(self._key)
+
+    def __next__(self):
+        while True:
+            step = self.advance()
+            if step is AGAIN:
+                continue
+            if step is WOULD_BLOCK:
+                raise BucketWouldBlock(
+                    f'bucket is at capacity {self._bucket.capacity}; retry '
+                    f'after draining another key'
+                )
+            if step is EXHAUSTED:
+                raise StopIteration
+            return step
 
 
 def spy(iterable, n=1):

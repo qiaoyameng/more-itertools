@@ -1142,6 +1142,156 @@ class BucketTests(TestCase):
         self.assertEqual(set(D), {10, 20})
 
 
+class BoundedBucketTests(TestCase):
+    def test_basic_delivery(self):
+        b = mi.bounded_bucket(
+            [10, 20, 30, 11, 21, 31, 12, 22, 23, 33],
+            key=lambda x: 10 * (x // 10),
+            capacity=10,
+        )
+        self.assertEqual(mi.take(3, b[10]), [10, 11, 12])
+        self.assertEqual(mi.take(4, b[20]), [20, 21, 22, 23])
+        self.assertEqual(mi.take(3, b[30]), [30, 31, 33])
+        self.assertEqual(len(b), 0)
+
+    def test_invalid_capacity(self):
+        for capacity in (0, -1, 1.5):
+            with self.assertRaises(ValueError):
+                mi.bounded_bucket([], key=lambda x: x, capacity=capacity)
+
+    def test_capacity_never_exceeded_with_candidate(self):
+        # Four foreign records fit exactly; the fifth blocks before pull.
+        b = mi.bounded_bucket(
+            [1, 2, 3, 4, 0], key=lambda x: 'z' if x else 'a', capacity=4
+        )
+        for expected in (mi.AGAIN, mi.AGAIN, mi.AGAIN, mi.AGAIN):
+            self.assertIs(b.advance('a'), expected)
+            self.assertLessEqual(len(b), 4)
+        # The cache is full; pulling 0 would exceed capacity.
+        self.assertIs(b.advance('a'), mi.WOULD_BLOCK)
+        self.assertEqual(len(b), 4)
+        # Foreign data was cached, not discarded.
+        self.assertEqual(list(b['z']), [1, 2, 3, 4])
+        # Now there is room; the final record arrives.
+        self.assertEqual(b.advance('a'), 0)
+        self.assertIs(b.advance('a'), mi.EXHAUSTED)
+
+    def test_would_block_recovers_after_other_branch_drains(self):
+        b = mi.bounded_bucket(
+            ['s1', 's2', 's3', 'f1'], key=lambda x: x[0], capacity=3
+        )
+        self.assertIs(b.advance('f'), mi.AGAIN)
+        self.assertIs(b.advance('f'), mi.AGAIN)
+        self.assertIs(b.advance('f'), mi.AGAIN)
+        self.assertIs(b.advance('f'), mi.WOULD_BLOCK)
+        self.assertEqual(mi.take(3, b['s']), ['s1', 's2', 's3'])
+        # Resumes without losing or duplicating anything.
+        self.assertEqual(b.advance('f'), 'f1')
+        self.assertIs(b.advance('f'), mi.EXHAUSTED)
+
+    def test_only_one_candidate_is_held(self):
+        pulled = []
+
+        def source():
+            for value in ('s1', 's2', 'f1', 'f2'):
+                pulled.append(value)
+                yield value
+
+        b = mi.bounded_bucket(source(), key=lambda x: x[0], capacity=4)
+        self.assertIs(b.advance('f'), mi.AGAIN)
+        self.assertEqual(pulled, ['s1'])
+        self.assertIs(b._candidate, None)  # integrated, not held
+        self.assertIs(b.advance('f'), mi.AGAIN)
+        self.assertEqual(pulled, ['s1', 's2'])
+        self.assertEqual(b.advance('f'), 'f1')
+        self.assertEqual(b.advance('f'), 'f2')
+
+    def test_close_skips_future_items_and_releases_buffer(self):
+        b = mi.bounded_bucket(
+            ['x1', 'y1', 'x2', 'y2'], key=lambda x: x[0], capacity=4
+        )
+        self.assertIs(b.advance('y'), mi.AGAIN)  # buffers x1
+        self.assertIn('x', b)
+        b.close('x')
+        self.assertNotIn('x', b)
+        self.assertEqual(len(b), 0)
+        self.assertEqual(list(b['y']), ['y1', 'y2'])
+        # x2 was skipped when scanning for y2.
+        self.assertIs(b.advance('x'), mi.EXHAUSTED)
+        self.assertEqual(list(b['x']), [])
+
+    def test_outstanding_iterator_terminates_after_close(self):
+        b = mi.bounded_bucket(
+            ['a1', 'b1', 'a2'], key=lambda x: x[0], capacity=3
+        )
+        a = b['a']
+        self.assertEqual(next(a), 'a1')
+        b.close('a')
+        self.assertIs(a.advance(), mi.EXHAUSTED)
+        with self.assertRaises(StopIteration):
+            next(a)
+        self.assertEqual(list(b['a']), [])
+
+    def test_next_raises_recoverable_would_block(self):
+        b = mi.bounded_bucket([1, 2, 0], key=lambda x: 'z' if x else 'a',
+                              capacity=2)
+        f = b['a']
+        self.assertIs(f.advance(), mi.AGAIN)
+        self.assertIs(f.advance(), mi.AGAIN)
+        with self.assertRaises(mi.BucketWouldBlock):
+            next(f)
+        self.assertEqual(list(b['z']), [1, 2])
+        self.assertEqual(next(f), 0)
+
+    def test_keys_and_contains_are_bounded(self):
+        b = mi.bounded_bucket(count(), key=lambda x: x % 2, capacity=4)
+        self.assertEqual(list(b), [])
+        self.assertFalse(0 in b)
+        self.assertFalse(1 in b)
+        # Scanning for odd buffers the even record, nothing more.
+        self.assertIs(b.advance(1), mi.AGAIN)
+        self.assertEqual(list(b), [0])
+        self.assertIn(0, b)
+        self.assertEqual(b.advance(1), 1)
+        self.assertEqual(len(b), 1)
+
+    def test_interleaved_branches_each_record_once(self):
+        # Slow key prefixes fill the cache; fast branch keeps blocking until
+        # the slow branch drains, and every record is received exactly once.
+        data = [('s', i) for i in range(6)] + [
+            item for i in range(6) for item in (('f', i), ('s', i + 6))
+        ]
+        b = mi.bounded_bucket(iter(data), key=lambda x: x[0], capacity=6)
+
+        got = {'f': [], 's': []}
+
+        def drain(branch, limit):
+            taken = 0
+            for _ in range(limit + 6):
+                if taken >= limit:
+                    break
+                step = b.advance(branch)
+                if step is mi.EXHAUSTED:
+                    return False
+                if step in (mi.AGAIN, mi.WOULD_BLOCK):
+                    continue
+                got[branch].append(step)
+                taken += 1
+            return True
+
+        fast_active = slow_active = True
+        while fast_active or slow_active:
+            fast_active = drain('f', 2) and fast_active
+            slow_active = drain('s', 1) and slow_active
+
+        expected = {
+            'f': [('f', i) for i in range(6)],
+            's': [('s', i) for i in range(12)],
+        }
+        self.assertEqual(got, expected)
+        self.assertEqual(len(b), 0)
+
+
 class SpyTests(TestCase):
     """Tests for ``spy()``"""
 

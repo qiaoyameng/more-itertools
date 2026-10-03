@@ -26,6 +26,8 @@ These tools yield groups of items from a source iterable.
 .. autofunction:: split_into
 .. autofunction:: split_when
 .. autoclass:: bucket
+.. autoclass:: bounded_bucket
+.. autoexception:: BucketWouldBlock
 .. autofunction:: unzip
 
 ----
