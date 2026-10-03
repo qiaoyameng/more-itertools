@@ -59,7 +59,10 @@ __all__ = [
     'dft',
     'difference',
     'distinct_combinations',
+    'distinct_permutation_rank',
+    'distinct_permutation_unrank',
     'distinct_permutations',
+    'distinct_permutations_count',
     'distribute',
     'divide',
     'doublestarmap',
@@ -235,6 +238,15 @@ def strictly_n(
 def distinct_permutations(
     iterable: Iterable[_T], r: int | None = ...
 ) -> Iterator[tuple[_T, ...]]: ...
+def distinct_permutations_count(
+    iterable: Iterable[_T], r: int | None = ...
+) -> int: ...
+def distinct_permutation_unrank(
+    iterable: Iterable[_T], rank: int, r: int | None = ...
+) -> tuple[_T, ...]: ...
+def distinct_permutation_rank(
+    iterable: Iterable[_T], permutation: Iterable[_T]
+) -> int: ...
 def derangements(
     iterable: Iterable[_T], r: int | None = None
 ) -> Iterator[tuple[_T, ...]]: ...

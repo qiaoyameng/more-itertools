@@ -8,6 +8,9 @@ Version History
 Unreleased
 ----------
 
+* New functions:
+    * :func:`distinct_permutations_count`, :func:`distinct_permutation_unrank`, and :func:`distinct_permutation_rank` were added. They count, locate, and rank distinct permutations in the order used by :func:`distinct_permutations` directly, without generating the preceding permutations, so arbitrarily large ranks can be used to shard the output among workers.
+
 * Changes to existing functions:
     * :func:`ichunked` now matches :func:`chunked` for ``n = 0`` and negative *n*: it yields nothing for a zero chunk size (without consuming the source) and raises ``ValueError: n must be at least 0`` instead of leaking :func:`itertools.islice`'s error.
     * :func:`running_min`, :func:`running_max`, :func:`running_mean`, and :func:`running_statistics` now consistently validate *maxlen* as an integer and support the index protocol.

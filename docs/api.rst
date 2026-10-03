@@ -237,6 +237,9 @@ These tools yield combinatorial arrangements of items from iterables.
 **New itertools**
 
 .. autofunction:: distinct_permutations
+.. autofunction:: distinct_permutations_count
+.. autofunction:: distinct_permutation_unrank
+.. autofunction:: distinct_permutation_rank
 .. autofunction:: distinct_combinations
 .. autofunction:: nth_combination_with_replacement
 .. autofunction:: circular_shifts

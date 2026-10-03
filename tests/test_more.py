@@ -27,7 +27,7 @@ from itertools import (
     product,
     repeat,
 )
-from math import factorial
+from math import factorial, perm
 from operator import add, mul, itemgetter, not_
 from pickle import loads, dumps
 from random import Random, choices, random, randrange, seed
@@ -572,6 +572,215 @@ class DistinctPermutationsTests(TestCase):
                     actual = list(mi.distinct_permutations(iterable, r=r))
                     expected = sorted(set(permutations(iterable, r=r)))
                     self.assertEqual(actual, expected)
+
+
+class DistinctPermutationRankUnrankTests(TestCase):
+    iterables = [
+        [],
+        ['a'],
+        [1, 0, 1],
+        [2, 2, 3, 1],
+        [0, 1, 1, 0],
+        list('mississippi'),
+        [1, True, 2],
+        [[2], [1], [1]],
+    ]
+
+    def test_count_matches_generator(self):
+        for iterable in self.iterables:
+            for r in range(len(iterable) + 3):
+                with self.subTest(iterable=iterable, r=r):
+                    actual = mi.distinct_permutations_count(iterable, r=r)
+                    expected = mi.ilen(mi.distinct_permutations(iterable, r=r))
+                    self.assertEqual(actual, expected)
+            with self.subTest(iterable=iterable, r=None):
+                actual = mi.distinct_permutations_count(iterable)
+                expected = mi.ilen(mi.distinct_permutations(iterable))
+                self.assertEqual(actual, expected)
+
+    def test_unrank_matches_generator(self):
+        for iterable in self.iterables:
+            for r in range(len(iterable) + 1):
+                with self.subTest(iterable=iterable, r=r):
+                    expected = list(mi.distinct_permutations(iterable, r=r))
+                    actual = [
+                        mi.distinct_permutation_unrank(iterable, i, r=r)
+                        for i in range(len(expected))
+                    ]
+                    self.assertEqual(actual, expected)
+
+    def test_rank_matches_generator(self):
+        for iterable in self.iterables:
+            for r in range(len(iterable) + 1):
+                with self.subTest(iterable=iterable, r=r):
+                    for i, p in enumerate(
+                        mi.distinct_permutations(iterable, r=r)
+                    ):
+                        self.assertEqual(
+                            mi.distinct_permutation_rank(iterable, p), i
+                        )
+
+    def test_round_trip(self):
+        for iterable in self.iterables:
+            n = len(iterable)
+            for r in range(n + 1):
+                total = mi.distinct_permutations_count(iterable, r=r)
+                for i in {0, total // 3, total // 2, total - 1}:
+                    with self.subTest(iterable=iterable, r=r, i=i):
+                        p = mi.distinct_permutation_unrank(iterable, i, r=r)
+                        self.assertEqual(
+                            mi.distinct_permutation_rank(iterable, p), i
+                        )
+
+    def test_equal_but_not_identical_elements(self):
+        # Equal elements are deduplicated by value; unrank emits the first
+        # element of each equality group in sorted order as representative.
+        iterable = [1, True, 2]
+        generated = list(mi.distinct_permutations(iterable))
+        for i, p in enumerate(generated):
+            unranked = mi.distinct_permutation_unrank(iterable, i)
+            self.assertEqual(unranked, p)
+            self.assertEqual(mi.distinct_permutation_rank(iterable, p), i)
+        # The representative of the {1, True} group is 1, the first of the
+        # group in sorted order.
+        self.assertEqual(
+            mi.distinct_permutation_unrank(iterable, 2), (2, 1, 1)
+        )
+        # Ranking matches by equality, so 1 and True rank the same.
+        self.assertEqual(
+            mi.distinct_permutation_rank(iterable, (2, True, 1)), 2
+        )
+        self.assertEqual(mi.distinct_permutation_rank(iterable, (2, 1, 1)), 2)
+
+    def test_negative_rank(self):
+        iterable = [1, 0, 1]
+        expected = list(mi.distinct_permutations(iterable))
+        for i in range(len(expected)):
+            self.assertEqual(
+                mi.distinct_permutation_unrank(iterable, i - len(expected)),
+                expected[i],
+            )
+
+    def test_rank_out_of_range(self):
+        iterable = [1, 0, 1]
+        for rank in (3, 4, -4, 10**30):
+            with self.subTest(rank=rank):
+                with self.assertRaises(IndexError):
+                    mi.distinct_permutation_unrank(iterable, rank)
+        # No permutations exist when r exceeds the number of elements.
+        with self.assertRaises(IndexError):
+            mi.distinct_permutation_unrank(iterable, 0, r=4)
+
+    def test_empty_permutation(self):
+        self.assertEqual(mi.distinct_permutations_count([]), 1)
+        self.assertEqual(mi.distinct_permutations_count([1, 2], r=0), 1)
+        self.assertEqual(mi.distinct_permutation_unrank([], 0), ())
+        self.assertEqual(mi.distinct_permutation_unrank([1, 2], 0, r=0), ())
+        self.assertEqual(mi.distinct_permutation_rank([], ()), 0)
+        self.assertEqual(mi.distinct_permutation_rank([1, 2], ()), 0)
+        with self.assertRaises(IndexError):
+            mi.distinct_permutation_unrank([], 1)
+
+    def test_negative_r(self):
+        with self.assertRaises(ValueError):
+            mi.distinct_permutations_count([1, 2], r=-1)
+        with self.assertRaises(ValueError):
+            mi.distinct_permutation_unrank([1, 2], 0, r=-1)
+
+    def test_invalid_permutation(self):
+        iterable = [1, 0, 1]
+        # Element not in the iterable
+        with self.assertRaises(ValueError):
+            mi.distinct_permutation_rank(iterable, (0, 2))
+        # Element not comparable with the elements of the iterable
+        with self.assertRaises(ValueError):
+            mi.distinct_permutation_rank(iterable, (0, '1'))
+        # An element repeated more often than in the iterable
+        with self.assertRaises(ValueError):
+            mi.distinct_permutation_rank(iterable, (0, 0))
+        # More elements than the iterable
+        with self.assertRaises(ValueError):
+            mi.distinct_permutation_rank(iterable, (0, 1, 1, 0))
+
+    def test_unsortable(self):
+        iterable = ['1', 2, 2, 3, 3, 3]
+        with self.assertRaises(TypeError):
+            mi.distinct_permutations_count(iterable)
+        with self.assertRaises(TypeError):
+            mi.distinct_permutation_unrank(iterable, 0)
+        with self.assertRaises(TypeError):
+            mi.distinct_permutation_rank(iterable, (2,))
+
+    def test_huge_rank_located_directly(self):
+        # 13! = 6,227,020,800 permutations: the billionth one is located
+        # directly, without iterating past the preceding ones.
+        iterable = list(range(13))
+        total = mi.distinct_permutations_count(iterable)
+        self.assertEqual(total, 6227020800)
+        p = mi.distinct_permutation_unrank(iterable, 1_000_000_000)
+        self.assertEqual(p, (2, 1, 0, 8, 10, 7, 9, 12, 4, 6, 11, 3, 5))
+        self.assertEqual(mi.distinct_permutation_rank(iterable, p), 10**9)
+        # The first and last permutations are the sorted arrangements.
+        self.assertEqual(
+            mi.distinct_permutation_unrank(iterable, 0), tuple(range(13))
+        )
+        self.assertEqual(
+            mi.distinct_permutation_unrank(iterable, -1),
+            tuple(range(12, -1, -1)),
+        )
+
+    def test_huge_multiset_rank_located_directly(self):
+        # A multiset whose permutation count has 59 digits; enumerating it
+        # is infeasible, so a correct round trip proves direct location.
+        iterable = list('abcd') * 25
+        total = mi.distinct_permutations_count(iterable)
+        self.assertEqual(total, mi.multinomial(25, 25, 25, 25))
+        for rank in (0, 1, total // 2, total - 2, total - 1):
+            with self.subTest(rank=rank):
+                p = mi.distinct_permutation_unrank(iterable, rank)
+                self.assertEqual(
+                    mi.distinct_permutation_rank(iterable, p), rank
+                )
+
+    def test_huge_partial_permutations(self):
+        # r-length permutations of a multiset, with a total far too large
+        # to enumerate.
+        iterable = list(range(20))
+        total = mi.distinct_permutations_count(iterable, r=10)
+        self.assertEqual(total, perm(20, 10))
+        p = mi.distinct_permutation_unrank(iterable, total // 3, r=10)
+        self.assertEqual(
+            mi.distinct_permutation_rank(iterable, p), total // 3
+        )
+
+    def test_sharding(self):
+        # Contiguous blocks of ranks can be assigned to workers; each
+        # worker locates the first permutation of its block directly.
+        iterable = list('mississippi')
+        workers = 4
+        total = mi.distinct_permutations_count(iterable)
+        blocks = [
+            range(w * total // workers, (w + 1) * total // workers)
+            for w in range(workers)
+        ]
+        # The blocks tile the whole range of ranks without overlap.
+        self.assertEqual(
+            [i for block in blocks for i in block], list(range(total))
+        )
+        # Each block boundary is located directly and ranks back to its
+        # own position.
+        for w, block in enumerate(blocks):
+            with self.subTest(worker=w):
+                first = mi.distinct_permutation_unrank(iterable, block.start)
+                self.assertEqual(
+                    mi.distinct_permutation_rank(iterable, first), block.start
+                )
+        # Spot-check the first block against the generator.
+        expected = list(mi.distinct_permutations(iterable))
+        for i in blocks[0]:
+            self.assertEqual(
+                mi.distinct_permutation_unrank(iterable, i), expected[i]
+            )
 
 
 class DerangementsTests(TestCase):

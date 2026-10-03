@@ -3,6 +3,7 @@ __lazy_modules__ = frozenset({'queue', 'threading'})
 import math
 import types
 
+from bisect import bisect_left
 from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from contextlib import suppress
@@ -56,6 +57,7 @@ from .recipes import (
     unique_everseen,
     all_equal,
     batched,
+    multinomial,
 )
 
 __all__ = [
@@ -86,7 +88,10 @@ __all__ = [
     'dft',
     'difference',
     'distinct_combinations',
+    'distinct_permutation_rank',
+    'distinct_permutation_unrank',
     'distinct_permutations',
+    'distinct_permutations_count',
     'distribute',
     'divide',
     'doublestarmap',
@@ -900,6 +905,314 @@ def distinct_permutations(iterable, r=None):
             )
 
     return iter(() if r else ((),))
+
+
+def _distinct_permutation_groups(iterable):
+    # Sort the items and group the equal ones together. *iterable* must be
+    # sortable; the TypeError raised by sorted() propagates otherwise.
+    # Because sorted() is stable, the first item of each group is the one
+    # that appeared first in *iterable* among the equal items of the group.
+    values = []
+    counts = []
+    for item in sorted(iterable):
+        if counts and values[-1] == item:
+            counts[-1] += 1
+        else:
+            values.append(item)
+            counts.append(1)
+
+    return values, counts
+
+
+def _count_distinct_permutations(counts, r):
+    # Number of distinct r-length permutations of a multiset whose distinct
+    # values have the multiplicities *counts*, with 0 <= r <= sum(counts).
+    total = sum(counts)
+    if r == 0:
+        return 1
+    if r == total:
+        return multinomial(*counts)
+    if max(counts) == 1:
+        return perm(total, r)
+
+    # r! times the coefficient of x**r in the exponential generating
+    # function prod(sum(x**j / j! for j in range(c + 1)) for c in counts).
+    dp = [1] + [0] * r
+    for c in counts:
+        if c == 0:
+            continue
+        new = [1]
+        for t in range(1, r + 1):
+            new.append(
+                dp[t]
+                + sum(dp[t - j] * comb(t, j) for j in range(1, min(c, t) + 1))
+            )
+        dp = new
+
+    return dp[r]
+
+
+def distinct_permutations_count(iterable, r=None):
+    """Return the number of distinct permutations of the elements in
+    *iterable*, i.e. ``ilen(distinct_permutations(iterable, r))``, computed
+    directly without generating any permutations.
+
+        >>> distinct_permutations_count([1, 0, 1])
+        3
+        >>> distinct_permutations_count('abracadabra')
+        83160
+
+    If *r* is given, only the *r*-length permutations are counted:
+
+        >>> distinct_permutations_count([1, 0, 1], r=2)
+        3
+        >>> distinct_permutations_count(range(3), r=2)
+        6
+
+    The result is an arbitrary precision integer, so totals too large to
+    enumerate are supported:
+
+        >>> distinct_permutations_count(range(13))
+        6227020800
+
+    Like :func:`distinct_permutations`, a single empty permutation is
+    counted for ``r == 0``, and no permutations are counted when *r*
+    exceeds the number of elements:
+
+        >>> distinct_permutations_count([1, 2], r=0)
+        1
+        >>> distinct_permutations_count([1, 2], r=3)
+        0
+
+    The elements of *iterable* must be sortable; ``TypeError`` is raised
+    otherwise. ``ValueError`` is raised if *r* is negative.
+    """
+    values, counts = _distinct_permutation_groups(iterable)
+    n = sum(counts)
+    if r is None:
+        r = n
+    if r < 0:
+        raise ValueError('r must be non-negative')
+    if r > n:
+        return 0
+
+    return _count_distinct_permutations(counts, r)
+
+
+def distinct_permutation_unrank(iterable, rank, r=None):
+    """Return the distinct permutation of the elements in *iterable* at
+    position *rank*, equivalent to
+    ``list(distinct_permutations(iterable, r))[rank]``, but computed
+    directly without generating the preceding permutations.
+
+        >>> distinct_permutation_unrank([1, 0, 1], 1)
+        (1, 0, 1)
+        >>> list(distinct_permutations([1, 0, 1]))
+        [(0, 1, 1), (1, 0, 1), (1, 1, 0)]
+
+    If *r* is given, the *r*-length permutations are used:
+
+        >>> distinct_permutation_unrank([1, 0, 1], 2, r=2)
+        (1, 1)
+        >>> list(distinct_permutations([1, 0, 1], r=2))
+        [(0, 1), (1, 0), (1, 1)]
+
+    *rank* is an arbitrary precision integer, so permutations whose
+    position is far too large to reach by iteration are located directly.
+    This makes the function suitable for sharding: each worker can be
+    assigned a contiguous block of ranks and jump straight to its first
+    permutation:
+
+        >>> total = distinct_permutations_count(range(13))
+        >>> total
+        6227020800
+        >>> distinct_permutation_unrank(range(13), 1_000_000_000)
+        (2, 1, 0, 8, 10, 7, 9, 12, 4, 6, 11, 3, 5)
+
+    Negative ranks count back from the end, and ``IndexError`` is raised
+    if *rank* is out of range:
+
+        >>> distinct_permutation_unrank([1, 0, 1], -1)
+        (1, 1, 0)
+
+    The elements of *iterable* must be sortable; ``TypeError`` is raised
+    otherwise. Equal elements are deduplicated by value, following
+    :func:`distinct_permutations`. When equal elements are not identical
+    (e.g. ``1`` and ``True``), the first one in sorted order - which, since
+    sorting is stable, is the one that appears first in *iterable* - is
+    used as the representative of its equality group, so the returned
+    permutation always compares equal to the one
+    :func:`distinct_permutations` would yield at the same position, but
+    may contain different (equal) objects:
+
+        >>> distinct_permutation_unrank([1, True, 2], 2)
+        (2, 1, 1)
+        >>> list(distinct_permutations([1, True, 2]))[2] == (2, 1, 1)
+        True
+
+    ``ValueError`` is raised if *r* is negative. For ``r == 0`` there is a
+    single empty permutation, and for *r* greater than the number of
+    elements there are none, mirroring :func:`distinct_permutations`:
+
+        >>> distinct_permutation_unrank([1, 2], 0, r=0)
+        ()
+        >>> distinct_permutation_unrank([], 0)
+        ()
+    """
+    values, counts = _distinct_permutation_groups(iterable)
+    n = sum(counts)
+    if r is None:
+        r = n
+    if r < 0:
+        raise ValueError('r must be non-negative')
+
+    total = _count_distinct_permutations(counts, r) if r <= n else 0
+    if rank < 0:
+        rank += total
+    if not 0 <= rank < total:
+        raise IndexError('distinct permutation rank out of range')
+
+    counts = list(counts)
+    result = []
+    if r == n:
+        # Full permutations: the number of completions after each choice
+        # is a multinomial coefficient, updated incrementally.
+        m = total
+        for pos in range(n):
+            remaining = n - pos
+            for i, c in enumerate(counts):
+                if c == 0:
+                    continue
+                block = m * c // remaining
+                if rank < block:
+                    result.append(values[i])
+                    counts[i] = c - 1
+                    m = block
+                    break
+                rank -= block
+    else:
+        # Partial permutations: count the completions of each candidate
+        # value with _count_distinct_permutations.
+        for pos in range(r):
+            remaining = r - pos - 1
+            for i, c in enumerate(counts):
+                if c == 0:
+                    continue
+                counts[i] = c - 1
+                block = _count_distinct_permutations(counts, remaining)
+                if rank < block:
+                    result.append(values[i])
+                    break
+                rank -= block
+                counts[i] = c
+
+    return tuple(result)
+
+
+def distinct_permutation_rank(iterable, permutation):
+    """Return the position of *permutation* among the distinct
+    permutations of the elements in *iterable*, equivalent to
+    ``list(distinct_permutations(iterable, len(permutation))).index(
+    tuple(permutation))``, but computed directly without generating the
+    preceding permutations.
+
+        >>> distinct_permutation_rank([1, 0, 1], (1, 0, 1))
+        1
+        >>> distinct_permutation_rank([1, 0, 1], (1, 1))
+        2
+
+    The result is an arbitrary precision integer:
+
+        >>> distinct_permutation_rank(
+        ...     range(13), (2, 1, 0, 8, 10, 7, 9, 12, 4, 6, 11, 3, 5)
+        ... )
+        1000000000
+
+    The elements of *iterable* must be sortable; ``TypeError`` is raised
+    otherwise. Elements of *permutation* are matched to the elements of
+    *iterable* by equality, following :func:`distinct_permutations`, so
+    equal but non-identical elements (e.g. ``1`` and ``True``) rank the
+    same:
+
+        >>> distinct_permutation_rank([1, True, 2], (2, True, 1))
+        2
+
+    ``ValueError`` is raised if *permutation* is not one of the distinct
+    permutations of *iterable* - if it has more elements than *iterable*,
+    contains an element that is not in *iterable*, or contains an element
+    more times than it appears in *iterable*:
+
+        >>> distinct_permutation_rank([1, 0, 1], (1, 2))
+        Traceback (most recent call last):
+        ...
+        ValueError: (1, 2) is not a distinct permutation of the iterable
+
+    The empty permutation has rank 0, mirroring the single empty
+    permutation produced by :func:`distinct_permutations` for ``r == 0``:
+
+        >>> distinct_permutation_rank([1, 2], ())
+        0
+    """
+    values, counts = _distinct_permutation_groups(iterable)
+    n = sum(counts)
+    permutation = tuple(permutation)
+    r = len(permutation)
+    if r > n:
+        raise ValueError(
+            f'{permutation!r} is not a distinct permutation of the iterable'
+        )
+
+    def locate(x):
+        try:
+            i = bisect_left(values, x)
+        except TypeError:
+            i = len(values)
+        if i == len(values) or values[i] != x:
+            raise ValueError(
+                f'{permutation!r} is not a distinct permutation '
+                f'of the iterable'
+            )
+        return i
+
+    counts = list(counts)
+    rank = 0
+    if r == n:
+        # Full permutations: see distinct_permutation_unrank.
+        m = multinomial(*counts)
+        for pos in range(n):
+            i = locate(permutation[pos])
+            remaining = n - pos
+            for c in counts[:i]:
+                if c:
+                    rank += m * c // remaining
+            c = counts[i]
+            if c == 0:
+                raise ValueError(
+                    f'{permutation!r} is not a distinct permutation '
+                    f'of the iterable'
+                )
+            m = m * c // remaining
+            counts[i] = c - 1
+    else:
+        # Partial permutations: see distinct_permutation_unrank.
+        for pos in range(r):
+            i = locate(permutation[pos])
+            remaining = r - pos - 1
+            for j in range(i):
+                c = counts[j]
+                if c:
+                    counts[j] = c - 1
+                    rank += _count_distinct_permutations(counts, remaining)
+                    counts[j] = c
+            c = counts[i]
+            if c == 0:
+                raise ValueError(
+                    f'{permutation!r} is not a distinct permutation '
+                    f'of the iterable'
+                )
+            counts[i] = c - 1
+
+    return rank
 
 
 def derangements(iterable, r=None):
