@@ -56,6 +56,7 @@ __all__ = [
     'count_cycle',
     'countable',
     'derangements',
+    'diagonal_product',
     'dft',
     'difference',
     'distinct_combinations',
@@ -951,6 +952,9 @@ def constrained_batches(
     get_len: Callable[[_T], object] = ...,
     strict: bool = ...,
 ) -> Iterator[tuple[_T]]: ...
+def diagonal_product(
+    *iterables: Iterable[_T]
+) -> Iterator[tuple[_T, ...]]: ...
 def gray_product(
     *iterables: Iterable[_T], repeat: int = ...
 ) -> Iterator[tuple[_T, ...]]: ...

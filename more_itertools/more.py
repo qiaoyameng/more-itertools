@@ -83,6 +83,7 @@ __all__ = [
     'count_cycle',
     'countable',
     'derangements',
+    'diagonal_product',
     'dft',
     'difference',
     'distinct_combinations',
@@ -4988,6 +4989,92 @@ def constrained_batches(
 
     if batch:
         yield tuple(batch)
+
+
+def diagonal_product(*iterables):
+    """Yield tuples from the Cartesian product of *iterables* in order of
+    the sum of the indices of their elements.
+
+    Tuples with the same index sum are produced in lexicographic order:
+
+        >>> list(diagonal_product('AB', 'CD'))
+        [('A', 'C'), ('B', 'C'), ('A', 'D'), ('B', 'D')]
+
+    Unlike :func:`itertools.product`, this allows some input iterables to be
+    infinite. Every finite combination is still eventually produced:
+
+        >>> list(islice(diagonal_product(count(), 'abc'), 6))
+        [(0, 'a'), (1, 'a'), (0, 'b'), (2, 'a'), (1, 'b'), (0, 'c')]
+
+    When one input is exhausted, enumeration continues with index
+    combinations that the remaining inputs can supply. If any input is empty,
+    no tuple can be formed and iteration stops.
+
+    Items already consumed from an input are cached because later diagonal
+    layers revisit earlier prefixes. The caches grow as longer prefixes are
+    visited, so this does not provide constant memory usage for arbitrary
+    infinite Cartesian products. Items are indexed by their input position,
+    not their value, so equal values from different positions are kept.
+
+    With no arguments, the product of zero iterables is yielded once:
+
+        >>> list(diagonal_product())
+        [()]
+    """
+    if not iterables:
+        yield ()
+        return
+
+    iterators = tuple(map(iter, iterables))
+    caches = [[] for _ in iterators]
+
+    def extend_indices(position, remaining, indices):
+        if position == len(iterators) - 1:
+            if remaining < len(caches[position]):
+                indices[position] = remaining
+                yield tuple(
+                    cache[index] for cache, index in zip(caches, indices)
+                )
+            return
+
+        future_capacity = sum(
+            len(cache) - 1 for cache in caches[position + 1:]
+        )
+        lower = max(0, remaining - future_capacity)
+        upper = min(remaining, len(caches[position]) - 1)
+        if upper < lower:
+            return
+        for index in range(upper, lower - 1, -1):
+            indices[position] = index
+            yield from extend_indices(position + 1, remaining - index, indices)
+
+    try:
+        for position, iterator in enumerate(iterators):
+            try:
+                caches[position].append(next(iterator))
+            except StopIteration:
+                return
+
+        yield tuple(cache[0] for cache in caches)
+
+        diagonal = 1
+        while True:
+            for position, iterator in enumerate(iterators):
+                try:
+                    caches[position].append(next(iterator))
+                except StopIteration:
+                    pass
+
+            indices = [0] * len(iterators)
+            yield from extend_indices(0, diagonal, indices)
+            max_diagonal = sum(len(cache) - 1 for cache in caches)
+            if diagonal >= max_diagonal:
+                break
+            diagonal += 1
+    finally:
+        for iterator in iterators:
+            with suppress(AttributeError):
+                iterator.close()
 
 
 def gray_product(*iterables, repeat=1):

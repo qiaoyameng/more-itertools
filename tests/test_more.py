@@ -6340,6 +6340,132 @@ class ConstrainedBatchesTests(TestCase):
             list(mi.constrained_batches([], 0))
 
 
+class DiagonalProductTests(TestCase):
+    def test_no_iterables(self):
+        self.assertEqual(list(mi.diagonal_product()), [()])
+
+    def test_empty_iterable(self):
+        self.assertEqual(list(mi.diagonal_product((), 'AB', 'CD')), [])
+        self.assertEqual(list(mi.diagonal_product('AB', (), 'CD')), [])
+        self.assertEqual(list(mi.diagonal_product('AB', 'CD', ())), [])
+
+    def test_finite_three_dimensions(self):
+        expected = [
+            (0, 0, 0),
+            (1, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+            (1, 1, 0),
+            (1, 0, 1),
+            (0, 1, 1),
+            (1, 1, 1),
+        ]
+
+        self.assertEqual(
+            list(mi.diagonal_product(range(2), range(2), range(2))),
+            expected,
+        )
+
+    def test_exhausted_iterable_continues(self):
+        expected = [
+            (0, 'a'),
+            (1, 'a'),
+            (0, 'b'),
+            (2, 'a'),
+            (1, 'b'),
+            (0, 'c'),
+            (3, 'a'),
+            (2, 'b'),
+            (1, 'c'),
+        ]
+
+        result = mi.diagonal_product(count(), 'abc')
+        self.assertEqual(list(islice(result, 9)), expected)
+
+    def test_infinite_first_layers_and_read_count(self):
+        class TrackingIterator:
+            def __init__(self, iterable):
+                self.iterator = iter(iterable)
+                self.reads = 0
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                value = next(self.iterator)
+                self.reads += 1
+                return value
+
+            def close(self):
+                self.closed = True
+                self.iterator.close()
+
+        numbers = TrackingIterator(count())
+        letters = TrackingIterator('abc')
+        result = mi.diagonal_product(numbers, letters)
+
+        self.assertEqual(
+            list(islice(result, 6)),
+            [(0, 'a'), (1, 'a'), (0, 'b'), (2, 'a'), (1, 'b'), (0, 'c')],
+        )
+        self.assertEqual(numbers.reads, 3)
+        self.assertEqual(letters.reads, 3)
+
+        result.close()
+        self.assertTrue(numbers.closed)
+        self.assertTrue(letters.closed)
+
+    def test_duplicate_values_keep_input_positions(self):
+        self.assertEqual(
+            list(mi.diagonal_product(iter('AA'), iter('AA'))),
+            [
+                ('A', 'A'),
+                ('A', 'A'),
+                ('A', 'A'),
+                ('A', 'A'),
+            ],
+        )
+
+    def test_source_error_closes_other_sources(self):
+        closed = []
+
+        def make_source(name, items, fail=False):
+            try:
+                yield from items
+                if fail:
+                    raise RuntimeError('boom')
+            finally:
+                closed.append(name)
+
+        good = make_source('good', range(4))
+        failing = make_source('failing', ('a', 'b', 'c'), fail=True)
+        other = make_source('other', (None,) * 4)
+        result = mi.diagonal_product(good, failing, other)
+
+        first_two_layers = [
+            (0, 'a', None),
+            (1, 'a', None),
+            (0, 'b', None),
+            (0, 'a', None),
+        ]
+        third_layer = [
+            (2, 'a', None),
+            (1, 'b', None),
+            (1, 'a', None),
+            (0, 'c', None),
+            (0, 'b', None),
+            (0, 'a', None),
+        ]
+        self.assertEqual(
+            list(islice(result, 10)), first_two_layers + third_layer
+        )
+        with self.assertRaises(RuntimeError):
+            next(result)
+
+        self.assertEqual(set(closed), {'good', 'failing', 'other'})
+
+
 class GrayProductTests(TestCase):
     def test_basic(self):
         self.assertEqual(
