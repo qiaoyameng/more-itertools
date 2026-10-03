@@ -1142,6 +1142,202 @@ class BucketTests(TestCase):
         self.assertEqual(set(D), {10, 20})
 
 
+class BoundedBucketTests(TestCase):
+    def test_maxsize_validation(self):
+        with self.assertRaises(ValueError):
+            mi.bounded_bucket([], key=lambda x: x, maxsize=0)
+
+    def test_basic(self):
+        iterable = [10, 20, 30, 11, 21, 31, 12, 22, 23, 33]
+        D = mi.bounded_bucket(
+            iterable, key=lambda x: 10 * (x // 10), maxsize=16
+        )
+
+        # In-order access
+        self.assertEqual(list(D[10]), [10, 11, 12])
+
+        # Out of order access
+        self.assertEqual(list(D[30]), [30, 31, 33])
+        self.assertEqual(list(D[20]), [20, 21, 22, 23])
+
+        self.assertEqual(list(D[40]), [])  # Nothing in here!
+
+    def test_full_blocks_then_recovers(self):
+        iterable = [10, 20, 21, 11]
+        D = mi.bounded_bucket(
+            iterable, key=lambda x: 10 * (x // 10), maxsize=2
+        )
+        it10 = D[10]
+        it20 = D[20]
+
+        self.assertEqual(next(it10), 10)
+
+        # Finding the next 10-record requires passing 20 and 21, which
+        # fill the cache; the blocked read is recoverable and loses nothing
+        with self.assertRaises(mi.BucketFull) as cm:
+            next(it10)
+        self.assertEqual(cm.exception.value, 10)
+
+        # Draining the other key frees capacity; the retry resumes reading
+        self.assertEqual(next(it20), 20)
+        self.assertEqual(next(it10), 11)
+        self.assertEqual(next(it20), 21)
+        self.assertRaises(StopIteration, next, it10)
+        self.assertRaises(StopIteration, next, it20)
+
+    def test_blocked_iterator_is_not_exhausted(self):
+        # A generator would be killed by raising; this iterator must survive
+        iterable = [20, 10]
+        D = mi.bounded_bucket(
+            iterable, key=lambda x: 10 * (x // 10), maxsize=1
+        )
+        it10 = D[10]
+        with self.assertRaises(mi.BucketFull):
+            next(it10)
+        self.assertEqual(next(D[20]), 20)
+        self.assertEqual(next(it10), 10)
+
+    def test_single_pending_candidate_counts_toward_capacity(self):
+        iterable = [20, 21, 10]
+        D = mi.bounded_bucket(
+            iterable, key=lambda x: 10 * (x // 10), maxsize=1
+        )
+        it10 = D[10]
+
+        # The first foreign record is retained (never discarded) and alone
+        # fills the capacity of 1
+        with self.assertRaises(mi.BucketFull):
+            next(it10)
+        self.assertEqual(D._held, 1)
+        self.assertLessEqual(D._held, D.maxsize)
+
+        # At most one pulled-but-not-yet-cached candidate exists, and the
+        # capacity accounting includes it
+        pending_count = 1 if D._pending is not None else 0
+        cached_count = sum(len(items) for items in D._cache.values())
+        self.assertLessEqual(pending_count, 1)
+        self.assertEqual(D._held, cached_count + pending_count)
+
+        # Nothing was lost: every record shows up exactly once
+        self.assertEqual(next(D[20]), 20)
+        with self.assertRaises(mi.BucketFull):
+            next(it10)  # 21 now occupies the single slot
+        self.assertEqual(next(D[20]), 21)
+        self.assertEqual(next(it10), 10)
+
+    def test_close(self):
+        iterable = [10, 20, 30, 11, 21, 31, 12, 22, 33]
+        D = mi.bounded_bucket(
+            iterable, key=lambda x: 10 * (x // 10), maxsize=8
+        )
+        it10 = D[10]
+        it20 = D[20]
+
+        self.assertEqual(next(it10), 10)
+        self.assertEqual(next(it10), 11)  # 20 and 30 get buffered
+
+        # Closing drops the buffered records and reports how many
+        self.assertEqual(D.close(20), 1)
+        self.assertNotIn(20, D)
+
+        # The already-issued iterator terminates normally, and new
+        # selections of the closed key are empty
+        self.assertEqual(list(it20), [])
+        self.assertEqual(list(D[20]), [])
+
+        # Future records with the closed key are skipped, not cached
+        self.assertEqual(list(it10), [12])
+        self.assertEqual(list(D[30]), [30, 31, 33])
+
+    def test_close_frees_capacity(self):
+        iterable = [20, 21, 10]
+        D = mi.bounded_bucket(
+            iterable, key=lambda x: 10 * (x // 10), maxsize=1
+        )
+        it10 = D[10]
+        with self.assertRaises(mi.BucketFull):
+            next(it10)  # 20 fills the only slot
+        D.close(20)
+        self.assertEqual(next(it10), 10)  # 21 is skipped after the close
+        self.assertRaises(StopIteration, next, it10)
+
+    def test_contains_is_bounded(self):
+        # Membership tests must not consume an infinite source
+        D = mi.bounded_bucket(count(0), key=lambda x: x % 3, maxsize=8)
+        self.assertNotIn(0, D)
+        self.assertEqual(next(D[0]), 0)
+        self.assertEqual(next(D[0]), 3)  # Buffers records for keys 1 and 2
+        held = D._held
+        self.assertIn(1, D)
+        self.assertIn(2, D)
+        self.assertNotIn(0, D)  # Key 0 has nothing buffered
+        self.assertNotIn(4, D)  # Unknown keys are not pulled into existence
+        self.assertEqual(D._held, held)  # No records were pulled or dropped
+
+    def test_keys_are_bounded(self):
+        # Iterating the keys must not consume an infinite source either
+        D = mi.bounded_bucket(count(0), key=lambda x: x % 3, maxsize=8)
+        self.assertEqual(set(D), set())
+        self.assertEqual(next(D[0]), 0)
+        self.assertEqual(next(D[0]), 3)
+        self.assertEqual(set(D), {1, 2})  # Only keys with buffered records
+        self.assertEqual(next(D[1]), 1)
+        self.assertEqual(set(D), {2})
+
+    def test_validator(self):
+        iterable = count(0)
+        key = lambda x: int(str(x)[0])  # First digit of each number
+        validator = lambda x: 0 < x < 10  # No leading zeros
+        D = mi.bounded_bucket(iterable, key, validator=validator, maxsize=16)
+        self.assertEqual(mi.take(3, D[1]), [1, 10, 11])
+        self.assertNotIn(0, D)  # Non-valid entries don't return True
+        self.assertNotIn(0, D._cache)  # Don't store non-valid entries
+        self.assertEqual(list(D[0]), [])
+
+    def test_alternating_speeds_exactly_once(self):
+        # Two branches advance at different speeds (3:1) against a cache
+        # too small to hold everything; every received record must appear
+        # exactly once
+        source = list(range(20))
+        D = mi.bounded_bucket(source, key=lambda x: x % 2, maxsize=4)
+        iterators = {0: D[0], 1: D[1]}  # 0: fast branch, 1: slow branch
+        received = {0: [], 1: []}
+        turn_order = [0, 0, 0, 1]  # Fast branch pulls 3x as often
+        blocked = {0: 0, 1: 0}
+        exhausted = set()
+        step = 0
+
+        while len(exhausted) < 2:
+            step += 1
+            self.assertLess(step, 1000)
+            value = turn_order[step % len(turn_order)]
+            if value in exhausted:
+                continue
+            try:
+                received[value].append(next(iterators[value]))
+            except mi.BucketFull:
+                # Recoverable: the other branch's turns free capacity
+                blocked[value] += 1
+            except StopIteration:
+                exhausted.add(value)
+            # Capacity invariant: cached + pending <= maxsize, one pending
+            pending_count = 1 if D._pending is not None else 0
+            cached_count = sum(len(items) for items in D._cache.values())
+            self.assertLessEqual(pending_count, 1)
+            self.assertEqual(D._held, cached_count + pending_count)
+            self.assertLessEqual(D._held, D.maxsize)
+
+        # The bounded cache really was too small: blocking did occur
+        self.assertGreater(blocked[0], 0)
+
+        # Each branch got its own records, in order, with no duplicates
+        self.assertEqual(received[0], list(range(0, 20, 2)))
+        self.assertEqual(received[1], list(range(1, 20, 2)))
+        combined = received[0] + received[1]
+        self.assertEqual(sorted(combined), source)
+        self.assertEqual(len(combined), len(set(combined)))
+
+
 class SpyTests(TestCase):
     """Tests for ``spy()``"""
 

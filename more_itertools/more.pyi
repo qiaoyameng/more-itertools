@@ -33,6 +33,7 @@ from _typeshed import (
 
 __all__ = [
     'AbortThread',
+    'BucketFull',
     'SequenceView',
     'adjacent',
     'all_unique',
@@ -40,6 +41,7 @@ __all__ = [
     'always_reversible',
     'argmax',
     'argmin',
+    'bounded_bucket',
     'bucket',
     'callback_iter',
     'chunked',
@@ -262,6 +264,25 @@ class bucket(Generic[_T, _U], Container[_U]):
         key: Callable[[_T], _U],
         validator: Callable[[_U], object] | None = ...,
     ) -> None: ...
+    def __contains__(self, value: object) -> bool: ...
+    def __iter__(self) -> Iterator[_U]: ...
+    def __getitem__(self, value: object) -> Iterator[_T]: ...
+
+class BucketFull(Exception):
+    value: Any
+    def __init__(self, value: object) -> None: ...
+
+class bounded_bucket(Generic[_T, _U], Container[_U]):
+    def __init__(
+        self,
+        iterable: Iterable[_T],
+        key: Callable[[_T], _U],
+        validator: Callable[[_U], object] | None = ...,
+        maxsize: int = ...,
+    ) -> None: ...
+    @property
+    def maxsize(self) -> int: ...
+    def close(self, value: _U) -> int: ...
     def __contains__(self, value: object) -> bool: ...
     def __iter__(self) -> Iterator[_U]: ...
     def __getitem__(self, value: object) -> Iterator[_T]: ...

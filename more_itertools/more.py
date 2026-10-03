@@ -60,6 +60,7 @@ from .recipes import (
 
 __all__ = [
     'AbortThread',
+    'BucketFull',
     'SequenceView',
     'adjacent',
     'all_unique',
@@ -67,6 +68,7 @@ __all__ = [
     'always_reversible',
     'argmax',
     'argmin',
+    'bounded_bucket',
     'bucket',
     'callback_iter',
     'chunked',
@@ -1238,6 +1240,225 @@ class bucket:
             return iter(())
 
         return self._get_values(value)
+
+
+class BucketFull(Exception):
+    """Raised by a :class:`bounded_bucket` child iterator when the shared
+    cache is at capacity and the source iterable cannot be advanced without
+    retaining another record.
+
+    This is a recoverable, blocking result: no item is pulled or lost.
+    Drain other keys (or :meth:`close <bounded_bucket.close>` keys that are
+    no longer needed) and then request the item again to resume reading.
+
+    The *value* attribute holds the key whose iterator was blocked.
+
+    """
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.value = value
+
+
+class bounded_bucket:
+    """A storage-bounded variant of :class:`bucket`. Wrap *iterable* and
+    return an object that buckets the iterable into child iterables based
+    on a *key* function, caching at most *maxsize* records at a time.
+
+        >>> iterable = ['a1', 'b1', 'b2', 'a2']
+        >>> s = bounded_bucket(iterable, key=lambda x: x[0], maxsize=2)
+        >>> a_iterable = s['a']
+        >>> next(a_iterable)
+        'a1'
+
+    When the cache is full, advancing a child iterator raises
+    :exc:`BucketFull`. The items found along the way are kept, so after
+    another bucket is drained the blocked iterator can simply be retried:
+
+        >>> next(a_iterable)  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+        ...
+        BucketFull: a
+        >>> b_iterable = s['b']
+        >>> next(b_iterable)
+        'b1'
+        >>> next(a_iterable)  # Retry after draining 'b'
+        'a2'
+        >>> next(b_iterable)
+        'b2'
+
+    At most one pulled-but-not-yet-cached candidate is retained at any
+    moment, and it counts toward *maxsize* together with the cached
+    records.
+
+    Call :meth:`close` for keys that are no longer of interest. Their
+    buffered records are dropped (freeing capacity), future items with
+    those keys are skipped instead of cached, and child iterators that
+    were already handed out terminate normally:
+
+        >>> iterable = ['c1', 'a3', 'c2', 'b3']
+        >>> s = bounded_bucket(iterable, key=lambda x: x[0], maxsize=2)
+        >>> s.close('c')
+        0
+        >>> list(s['a'])
+        ['a3']
+        >>> list(s['b'])
+        ['b3']
+
+    Iterating over the object and testing membership are bounded as well:
+    they report only what has been buffered so far and never advance the
+    source iterable, so they are safe to use with infinite sources:
+
+        >>> from itertools import count
+        >>> s = bounded_bucket(count(0), key=lambda x: x % 3, maxsize=8)
+        >>> set(s)
+        set()
+        >>> next(s[0])
+        0
+        >>> next(s[0])
+        3
+        >>> set(s)  # Keys with buffered records only
+        {1, 2}
+        >>> 1 in s, 0 in s
+        (True, False)
+
+    As with :class:`bucket`, a *validator* function may be supplied to
+    restrict which keys are stored.
+
+    """
+
+    def __init__(self, iterable, key, validator=None, maxsize=128):
+        if maxsize < 1:
+            raise ValueError('maxsize must be at least 1')
+        self._it = iter(iterable)
+        self._key = key
+        self._validator = validator or (lambda x: True)
+        self._maxsize = maxsize
+        self._cache = defaultdict(deque)
+        # Number of retained records: cached items plus the single
+        # pulled-but-not-yet-cached candidate, if any.
+        self._held = 0
+        self._pending = None
+        self._closed = set()
+        self._exhausted = False
+
+    @property
+    def maxsize(self):
+        """The maximum number of retained records (cached plus pending)."""
+        return self._maxsize
+
+    def close(self, value):
+        """Close the bucket for *value*.
+
+        Buffered records for *value* are dropped, items with that key will
+        be skipped (not cached) from now on, and child iterators already
+        issued for *value* terminate normally. Returns the number of
+        buffered records that were dropped.
+        """
+        self._closed.add(value)
+        dropped = len(self._cache.pop(value, ()))
+        if self._pending is not None and self._pending[0] == value:
+            self._pending = None
+            dropped += 1
+        self._held -= dropped
+        return dropped
+
+    def __contains__(self, value):
+        # Bounded: only inspects what is already buffered; never advances
+        # the source iterable.
+        if value in self._closed or not self._validator(value):
+            return False
+        if self._pending is not None and self._pending[0] == value:
+            return True
+        return bool(self._cache.get(value))
+
+    def __iter__(self):
+        # Bounded: yields the keys that currently have buffered records
+        # without advancing the source iterable.
+        for value, items in self._cache.items():
+            if items and value not in self._closed:
+                yield value
+        if self._pending is not None:
+            value = self._pending[0]
+            if (
+                value not in self._closed
+                and self._validator(value)
+                and not self._cache.get(value)
+            ):
+                yield value
+
+    def __getitem__(self, value):
+        if value in self._closed or not self._validator(value):
+            return iter(())
+
+        return _bounded_bucket_iterator(self, value)
+
+
+class _bounded_bucket_iterator:
+    """Child iterator for :class:`bounded_bucket`.
+
+    Implemented as a plain iterator (not a generator) so that raising
+    :exc:`BucketFull` does not exhaust it and the read can be retried.
+    """
+
+    def __init__(self, parent, value):
+        self._parent = parent
+        self._value = value
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        parent = self._parent
+        value = self._value
+        while True:
+            # Emit records already buffered for this key.
+            cached = parent._cache.get(value)
+            if cached:
+                parent._held -= 1
+                return cached.popleft()
+            # A closed key with an empty buffer terminates normally.
+            if value in parent._closed:
+                raise StopIteration
+            # Settle the single in-flight candidate, if there is one.
+            if parent._pending is not None:
+                pending_key, pending_item = parent._pending
+                if (
+                    pending_key in parent._closed
+                    or not parent._validator(pending_key)
+                ):
+                    parent._pending = None
+                    parent._held -= 1
+                    continue
+                if pending_key == value:
+                    parent._pending = None
+                    parent._held -= 1
+                    return pending_item
+                parent._cache[pending_key].append(pending_item)
+                parent._pending = None
+                continue
+            if parent._exhausted:
+                raise StopIteration
+            # Pulling may produce a record that must be retained, so
+            # require a free slot first. Blocking here is recoverable:
+            # nothing is pulled or lost, and the call can be retried
+            # after other buckets are drained.
+            if parent._held >= parent._maxsize:
+                raise BucketFull(value)
+            try:
+                item = next(parent._it)
+            except StopIteration:
+                parent._exhausted = True
+                raise StopIteration
+            item_key = parent._key(item)
+            if item_key in parent._closed or not parent._validator(item_key):
+                continue
+            if item_key == value:
+                return item
+            # Retain the pulled-but-not-yet-cached candidate. It counts
+            # toward capacity and is never discarded.
+            parent._pending = (item_key, item)
+            parent._held += 1
 
 
 def spy(iterable, n=1):
